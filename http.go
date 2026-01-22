@@ -31,9 +31,10 @@ type HttpHeadResp struct {
 }
 
 type HttpGetParams struct {
-  Header map[string]string
-  Host   string
-  Url    string
+  Header       map[string]string
+  Host         string
+  Url          string
+  SearchParams map[string]string
 }
 
 type HttpGetResp struct {
@@ -282,7 +283,16 @@ func HttpHead(ctx context.Context, client *http.Client, p *HttpHeadParams) (*Htt
 }
 
 func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpGetResp, error) {
-  req, err := http.NewRequestWithContext(ctx, "GET", p.Url, nil)
+  reqURL := p.Url
+  if len(p.SearchParams) > 0 {
+    params := url.Values{}
+    for k, v := range p.SearchParams {
+      params.Add(k, v)
+    }
+    reqURL = fmt.Sprintf("%s?%s", p.Url, params.Encode())
+  }
+
+  req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
   if err != nil {
     return &HttpGetResp{}, err
   }

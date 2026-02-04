@@ -299,7 +299,7 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
-		return &HttpGetResp{}, err
+		return nil, err
 	}
 	for k, v := range p.Header {
 		req.Header.Set(k, v)
@@ -317,19 +317,19 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
 
 	res, err := client.Do(req)
 	if err != nil {
-		return &HttpGetResp{}, err
+		return nil, err
 	}
 	defer res.Body.Close()
 
 	select {
 	case <-ctx.Done():
-		return &HttpGetResp{}, ctx.Err()
+		return nil, ctx.Err()
 	default:
 	}
 
 	bodyBytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return &HttpGetResp{}, err
+		return nil, err
 	}
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
@@ -340,11 +340,10 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
 		}
-		return &HttpGetResp{}, fmt.Errorf(errMsg)
+		return &HttpGetResp{StatusCode: res.StatusCode}, fmt.Errorf(errMsg)
 	}
 
 	return &HttpGetResp{
-		StatusCode: res.StatusCode,
 		Location:   res.Request.URL.String(),
 		Body:       bodyBytes,
 		RespHeader: res.Header,
@@ -427,7 +426,7 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
 
 	bodyBytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return &HttpPostResp{}, err
+		return nil, err
 	}
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
@@ -438,11 +437,10 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
 		}
-		return &HttpPostResp{}, fmt.Errorf(errMsg)
+		return &HttpPostResp{StatusCode: res.StatusCode}, fmt.Errorf(errMsg)
 	}
 
 	return &HttpPostResp{
-		StatusCode: res.StatusCode,
 		Body:       bodyBytes,
 		RespHeader: res.Header,
 		Cookies:    cookies,

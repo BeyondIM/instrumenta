@@ -340,7 +340,7 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
 		}
-		return &HttpGetResp{StatusCode: res.StatusCode}, fmt.Errorf(errMsg)
+		return &HttpGetResp{StatusCode: res.StatusCode, Body: bodyBytes}, fmt.Errorf(errMsg)
 	}
 
 	return &HttpGetResp{
@@ -437,7 +437,7 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
 		}
-		return &HttpPostResp{StatusCode: res.StatusCode}, fmt.Errorf(errMsg)
+		return &HttpPostResp{StatusCode: res.StatusCode, Body: bodyBytes}, fmt.Errorf(errMsg)
 	}
 
 	return &HttpPostResp{
@@ -486,7 +486,7 @@ func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
 		}
-		return nil, fmt.Errorf(errMsg)
+		return bodyBytes, fmt.Errorf(errMsg)
 	}
 
 	return bodyBytes, nil
@@ -527,7 +527,7 @@ func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) (
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
 		}
-		return nil, fmt.Errorf(errMsg)
+		return bodyBytes, fmt.Errorf(errMsg)
 	}
 
 	return bodyBytes, nil

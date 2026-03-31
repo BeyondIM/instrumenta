@@ -22,6 +22,20 @@ import (
   "golang.org/x/net/proxy"
 )
 
+type HTTPError struct {
+  StatusCode int
+  Body       []byte
+  Message    string
+}
+
+// 实现 error 接口
+func (e *HTTPError) Error() string {
+  if e.Message != "" {
+    return e.Message
+  }
+  return fmt.Sprintf("HTTP request failed with status code %d", e.StatusCode)
+}
+
 type HttpHeadParams struct {
   Header map[string]string
   Url    string
@@ -276,10 +290,6 @@ func HttpHead(ctx context.Context, client *http.Client, p *HttpHeadParams) (*Htt
   }
   defer res.Body.Close()
 
-  if res == nil {
-    return nil, fmt.Errorf("empty http response")
-  }
-
   select {
   case <-ctx.Done():
     return &HttpHeadResp{}, ctx.Err()
@@ -325,10 +335,6 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
   }
   defer res.Body.Close()
 
-  if res == nil {
-    return nil, fmt.Errorf("empty http response")
-  }
-
   select {
   case <-ctx.Done():
     return nil, ctx.Err()
@@ -348,7 +354,11 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
     if errMsg == "" {
       errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
     }
-    return &HttpGetResp{StatusCode: res.StatusCode, Body: bodyBytes}, fmt.Errorf(errMsg)
+    return nil, &HTTPError{
+      StatusCode: res.StatusCode,
+      Body:       bodyBytes,
+      Message:    errMsg,
+    }
   }
 
   return &HttpGetResp{
@@ -421,10 +431,6 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   }
   defer res.Body.Close()
 
-  if res == nil {
-    return nil, fmt.Errorf("empty http response")
-  }
-
   cookies := make(map[string]string)
   for _, c := range res.Cookies() {
     cookies[c.Name] = c.Value
@@ -449,7 +455,11 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
     if errMsg == "" {
       errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
     }
-    return &HttpPostResp{StatusCode: res.StatusCode, Body: bodyBytes}, fmt.Errorf(errMsg)
+    return nil, &HTTPError{
+      StatusCode: res.StatusCode,
+      Body:       bodyBytes,
+      Message:    errMsg,
+    }
   }
 
   return &HttpPostResp{
@@ -479,10 +489,6 @@ func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte
   }
   defer res.Body.Close()
 
-  if res == nil {
-    return nil, fmt.Errorf("empty http response")
-  }
-
   select {
   case <-ctx.Done():
     return nil, ctx.Err()
@@ -502,7 +508,11 @@ func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte
     if errMsg == "" {
       errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
     }
-    return bodyBytes, fmt.Errorf(errMsg)
+    return nil, &HTTPError{
+      StatusCode: res.StatusCode,
+      Body:       bodyBytes,
+      Message:    errMsg,
+    }
   }
 
   return bodyBytes, nil
@@ -524,10 +534,6 @@ func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) (
   }
   defer res.Body.Close()
 
-  if res == nil {
-    return nil, fmt.Errorf("empty http response")
-  }
-
   select {
   case <-ctx.Done():
     return nil, ctx.Err()
@@ -547,7 +553,11 @@ func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) (
     if errMsg == "" {
       errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
     }
-    return bodyBytes, fmt.Errorf(errMsg)
+    return nil, &HTTPError{
+      StatusCode: res.StatusCode,
+      Body:       bodyBytes,
+      Message:    errMsg,
+    }
   }
 
   return bodyBytes, nil

@@ -315,7 +315,7 @@ func GetClient(opts ...ClientOption) (*http.Client, error) {
   }
 
   // 2. 每次组装全新的 CookieJar（完全隔离不同调用的会话状态）
-  var jar *cookiejar.Jar
+  var jar http.CookieJar
   if builder.cookies != "" && builder.site != "" {
     jar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
     domain, err := url.Parse(builder.site)
@@ -335,6 +335,13 @@ func GetClient(opts ...ClientOption) (*http.Client, error) {
     Transport: sharedTransport,
     Timeout:   builder.timeout,
     Jar:       jar,
+    CheckRedirect: func(req *http.Request, via []*http.Request) error {
+      if len(via) >= 10 { // 限制最大 10 次重定向，防止死循环
+        // 返回 ErrUseLastResponse 不会产生 Error，而是让程序成功拿到最后的 3xx 响应
+        return http.ErrUseLastResponse
+      }
+      return nil
+    },
   }
 
   return client, nil
@@ -386,13 +393,6 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
     req.Host = p.Host
   }
 
-  client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-    if len(via) >= 10 { // prevent infinite loops
-      return http.ErrUseLastResponse
-    }
-    return nil
-  }
-
   res, err := client.Do(req)
   if err != nil {
     return nil, err
@@ -437,8 +437,12 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   var contentType string
   switch p.PostType {
   case "form-urlencoded":
+    bodyMap, ok := p.Body.(map[string]string)
+    if !ok {
+      return nil, fmt.Errorf("form-urlencoded requires map[string]string body, got %T", p.Body)
+    }
     data := url.Values{}
-    for k, v := range p.Body.(map[string]string) {
+    for k, v := range bodyMap {
       data.Set(k, v)
     }
     postBody.WriteString(data.Encode())
@@ -448,34 +452,56 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
     for k, v := range p.Body.(map[string]interface{}) {
       switch k {
       case "media":
-        file, err := os.Open(v.(string))
+        filePath, ok := v.(string)
+        if !ok {
+          return nil, fmt.Errorf("media field value must be a string path")
+        }
+        file, err := os.Open(filePath)
         if err != nil {
-          return nil, err
+          return nil, fmt.Errorf("failed to open media file: %w", err)
         }
         part, err := writer.CreateFormFile(k, filepath.Base(file.Name()))
         if err != nil {
-          return nil, err
+          file.Close() // 确保出错时关闭文件
+          return nil, fmt.Errorf("failed to create form file: %w", err)
         }
-        io.Copy(part, file)
-        file.Close()
+        if _, err := io.Copy(part, file); err != nil {
+          file.Close()
+          return nil, fmt.Errorf("failed to copy media file: %w", err)
+        }
+        file.Close() // 正常结束时关闭文件
       case "bufMedia":
+        reader, ok := v.(io.Reader)
+        if !ok {
+          return nil, fmt.Errorf("bufMedia field value must implement io.Reader")
+        }
         part, err := writer.CreateFormFile(k, "example.jpg")
         if err != nil {
-          return nil, err
+          return nil, fmt.Errorf("failed to create form file for bufMedia: %w", err)
         }
-        io.Copy(part, v.(io.Reader))
+        if _, err := io.Copy(part, reader); err != nil {
+          return nil, fmt.Errorf("failed to copy bufMedia: %w", err)
+        }
       default:
-        _, err := writer.CreateFormField(k)
-        if err != nil {
-          return nil, err
+        valStr, ok := v.(string)
+        if !ok {
+          return nil, fmt.Errorf("form-data field '%s' must be string, got %T", k, v)
         }
-        writer.WriteField(k, v.(string))
+        // WriteField 内部自带 CreateFormField 逻辑
+        if err := writer.WriteField(k, valStr); err != nil {
+          return nil, fmt.Errorf("failed to write form field '%s': %w", k, err)
+        }
       }
     }
     contentType = writer.FormDataContentType()
-    writer.Close()
+    if err := writer.Close(); err != nil {
+      return nil, err
+    }
   default:
-    body, _ := sonic.Marshal(p.Body)
+    body, err := sonic.Marshal(p.Body)
+    if err != nil {
+      return nil, fmt.Errorf("failed to marshal json body: %w", err)
+    }
     postBody.Write(body)
     contentType = "application/json"
   }
@@ -496,15 +522,14 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   defer res.Body.Close()
 
   cookies := make(map[string]string)
-  // resp.Cookies() 拿的是“增量指令”：它只包含服务端在当前这一次请求中，要求客户端新建、修改或删除的 Cookie。
-  // jar.Cookies(url) 拿的是“全量状态”：它包含客户端当前针对该域名持有的所有处于有效期内的 Cookie 集合。
   if client.Jar != nil {
+    // resp.Cookies() 拿的是“增量指令”：它只包含服务端在当前这一次请求中，要求客户端新建、修改或删除的 Cookie。
+    // jar.Cookies(url) 拿的是“全量状态”：它包含客户端当前针对该域名持有的所有处于有效期内的 Cookie 集合。
     domain, err := url.Parse(p.Url)
-    if err != nil {
-      return nil, fmt.Errorf("invalid site URL for cookies: %w", err)
-    }
-    for _, c := range client.Jar.Cookies(domain) {
-      cookies[c.Name] = c.Value
+    if err == nil { // 这里最好别让 url.Parse 的报错阻断了主流程（走到这里说明请求已经成功了）
+      for _, c := range client.Jar.Cookies(domain) {
+        cookies[c.Name] = c.Value
+      }
     }
   } else {
     for _, c := range res.Cookies() {
@@ -547,7 +572,10 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
 
 func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte, error) {
   postBody := new(bytes.Buffer)
-  body, _ := sonic.Marshal(p.Body)
+  body, err := sonic.Marshal(p.Body)
+  if err != nil {
+    return nil, fmt.Errorf("failed to marshal json body: %w", err)
+  }
   postBody.Write(body)
 
   req, err := http.NewRequestWithContext(ctx, "PUT", p.Url, postBody)

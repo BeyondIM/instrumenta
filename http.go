@@ -111,18 +111,6 @@ func (e *HTTPError) Error() string {
   return fmt.Sprintf("HTTP request failed with status code %d", e.StatusCode)
 }
 
-func transCookies(cookiesStr string) map[string]string {
-  cookies := make(map[string]string)
-  parts := strings.Split(cookiesStr, "; ")
-  for _, part := range parts {
-    kv := strings.SplitN(part, "=", 2)
-    if len(kv) == 2 {
-      cookies[kv[0]] = kv[1]
-    }
-  }
-  return cookies
-}
-
 func WithTimeout(timeout time.Duration) ClientOption {
   return func(b *clientBuilder) {
     b.timeout = timeout
@@ -332,15 +320,17 @@ func GetClient(opts ...ClientOption) (*http.Client, error) {
       cookieDomain = strings.Split(cookieDomain, ":")[0]
     }
 
-    cookies := transCookies(builder.cookies)
+    // 伪造一个带有 Cookie Header 的 Request
+    req := &http.Request{Header: http.Header{"Cookie": []string{builder.cookies}}}
+    // 直接调用标准库的解析方法，拿到的就是完全合法的 []*http.Cookie
+    parsedCookies := req.Cookies()
+    // 遍历注入泛域名和 Path
     var httpCookies []*http.Cookie
-    for k, v := range cookies {
-      httpCookies = append(httpCookies, &http.Cookie{
-        Name:   k,
-        Value:  v,
-        Domain: cookieDomain, // ✅ 强制指定泛域名属性
-        Path:   "/",          // ✅ 最佳实践：作用于全站路径
-      })
+    for _, c := range parsedCookies {
+      // 覆盖原有的属性
+      c.Domain = cookieDomain
+      c.Path = "/"
+      httpCookies = append(httpCookies, c)
     }
     jar.SetCookies(domainURL, httpCookies)
   }

@@ -5,6 +5,7 @@ go 1.25.4
 require (
 	github.com/bytedance/sonic v1.15.0
 	golang.org/x/net v0.52.0
+	golang.org/x/sync v0.11.0
 )
 
 require (

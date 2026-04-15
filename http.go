@@ -7,33 +7,35 @@ import (
   "crypto/x509"
   "encoding/json"
   "fmt"
+  "hash/fnv"
   "io"
   "mime/multipart"
   "net"
   "net/http"
+  "net/http/cookiejar"
   "net/url"
   "os"
   "path/filepath"
+  "strconv"
   "strings"
   "sync"
   "time"
 
   "github.com/bytedance/sonic"
   "golang.org/x/net/proxy"
+  "golang.org/x/net/publicsuffix"
+  "golang.org/x/sync/singleflight"
+)
+
+var (
+  transportCache sync.Map // Key: 网络配置哈希 -> Value: *http.Transport
+  sfGroup        singleflight.Group
 )
 
 type HTTPError struct {
   StatusCode int
   Body       []byte
   Message    string
-}
-
-// 实现 error 接口
-func (e *HTTPError) Error() string {
-  if e.Message != "" {
-    return e.Message
-  }
-  return fmt.Sprintf("HTTP request failed with status code %d", e.StatusCode)
 }
 
 type HttpHeadParams struct {
@@ -89,12 +91,6 @@ type UpstreamErr struct {
   Error string `json:"error"`
 }
 
-type clientCache struct {
-  clients sync.Map
-}
-
-var cache = &clientCache{}
-
 type clientBuilder struct {
   timeout               time.Duration
   responseHeaderTimeout time.Duration
@@ -102,8 +98,30 @@ type clientBuilder struct {
   caCert                string
   proxyURL              string
   randomProxy           bool
+  site                  string
+  cookies               string
 }
 type ClientOption func(*clientBuilder)
+
+// 实现 error 接口
+func (e *HTTPError) Error() string {
+  if e.Message != "" {
+    return e.Message
+  }
+  return fmt.Sprintf("HTTP request failed with status code %d", e.StatusCode)
+}
+
+func transCookies(cookiesStr string) map[string]string {
+  cookies := make(map[string]string)
+  parts := strings.Split(cookiesStr, "; ")
+  for _, part := range parts {
+    kv := strings.SplitN(part, "=", 2)
+    if len(kv) == 2 {
+      cookies[kv[0]] = kv[1]
+    }
+  }
+  return cookies
+}
 
 func WithTimeout(timeout time.Duration) ClientOption {
   return func(b *clientBuilder) {
@@ -137,116 +155,148 @@ func WithRandomProxy(proxyURL string) ClientOption {
   }
 }
 
-func (b *clientBuilder) key() string {
-  return fmt.Sprintf("%v_%v_%v_%v_%s_%v", b.timeout, b.responseHeaderTimeout, b.skipInsecure, len(b.caCert), b.proxyURL, b.randomProxy)
+func WithCookies(site string, cookies string) ClientOption {
+  return func(b *clientBuilder) {
+    b.site = site
+    b.cookies = cookies
+  }
 }
 
-func (b *clientBuilder) build() *http.Client {
-  // 1. 先确定基础 Dialer 配置
-  baseDialer := &net.Dialer{
-    Timeout:   10 * time.Second,
-    KeepAlive: 30 * time.Second,
+func (b *clientBuilder) transportKey() string {
+  h := fnv.New64a()
+  fmt.Fprintf(h, "%v_%v_%s_%s_%v",
+    b.responseHeaderTimeout,
+    b.skipInsecure,
+    b.caCert,
+    b.proxyURL,
+    b.randomProxy,
+  )
+  return strconv.FormatUint(h.Sum64(), 16)
+}
+
+func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
+  tKey := b.transportKey()
+
+  // 1. 快速路径（Fast Path）：绝大多数情况都会在这里命中缓存直接返回
+  if t, ok := transportCache.Load(tKey); ok {
+    return t.(*http.Transport), nil
   }
 
-  // 如果需要随机代理（禁用连接复用），调整 KeepAlive
-  if b.randomProxy {
-    baseDialer.KeepAlive = 0
-  }
-
-  // 2. 构建 Transport 基础配置
-  transport := &http.Transport{
-    ResponseHeaderTimeout: b.responseHeaderTimeout,
-    TLSHandshakeTimeout:   10 * time.Second,
-    IdleConnTimeout:       120 * time.Second,
-    MaxIdleConns:          100,
-    MaxIdleConnsPerHost:   20,
-    MaxConnsPerHost:       50,
-  }
-
-  // 3. 根据代理类型设置 DialContext 和 Proxy（只设置一次）
-  if b.proxyURL != "" {
-    proxyURL, err := url.Parse(b.proxyURL)
-    if err != nil {
-      return nil
+  // 2. 慢速路径（Slow Path）：使用 singleflight 防止并发创建
+  // v 是 fn 返回的值，err 是错误，shared 表示是否被多个调用共享了结果
+  v, err, _ := sfGroup.Do(tKey, func() (interface{}, error) {
+    // 【重要】Double-Check (双重校验)：
+    // 因为在执行到这里之前，可能已经有其他 Goroutine 刚好完成了创建并存入了缓存。
+    if t, ok := transportCache.Load(tKey); ok {
+      return t, nil
     }
 
-    switch {
-    case strings.HasPrefix(b.proxyURL, "socks5"):
-      // SOCKS5 代理：使用 proxy 包的 Dialer
-      socksDialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+    baseDialer := &net.Dialer{
+      Timeout:   10 * time.Second,
+      KeepAlive: 30 * time.Second,
+    }
+
+    // 随机代理模式：禁用连接复用
+    if b.randomProxy {
+      baseDialer.KeepAlive = 0
+    }
+
+    transport := &http.Transport{
+      ResponseHeaderTimeout: b.responseHeaderTimeout,
+      TLSHandshakeTimeout:   10 * time.Second,
+      IdleConnTimeout:       120 * time.Second,
+      MaxIdleConns:          100,
+      MaxIdleConnsPerHost:   20,
+      MaxConnsPerHost:       50,
+    }
+
+    if b.proxyURL != "" {
+      proxyURL, err := url.Parse(b.proxyURL)
       if err != nil {
-        return nil
+        return nil, fmt.Errorf("invalid proxy URL: %w", err)
       }
-
-      // 包装 SOCKS5 Dialer，添加超时控制
-      transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-        // 创建带超时的 context，参数中的 ctx 指的是 http client timeout deadline
-        dialCtx, cancel := context.WithTimeout(ctx, baseDialer.Timeout)
-        defer cancel()
-
-        // SOCKS5 Dialer 不支持 DialContext，需要手动处理超时
-        type result struct {
-          conn net.Conn
-          err  error
+      if strings.HasPrefix(b.proxyURL, "socks5") {
+        // proxy.Direct 是一个空的默认 Dialer，这意味着程序在连接 SOCKS5 代理服务器本身时，没有使用带有超时的 baseDialer，这可能导致在代理节点网络不通时，请求无限挂起。
+        socksDialer, err := proxy.FromURL(proxyURL, baseDialer)
+        if err != nil {
+          return nil, fmt.Errorf("failed to create socks proxy dialer: %w", err)
         }
-        resultCh := make(chan result, 1)
 
-        go func() {
-          conn, err := socksDialer.Dial(network, addr)
-          resultCh <- result{conn, err}
-        }()
+        transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+          // 优先尝试断言是否原生支持 Context
+          if contextDialer, ok := socksDialer.(proxy.ContextDialer); ok {
+            return contextDialer.DialContext(ctx, network, addr)
+          }
 
-        select {
-        case <-dialCtx.Done():
-          return nil, dialCtx.Err()
-        case res := <-resultCh:
-          return res.conn, res.err
+          // 手动处理 Goroutine 泄漏
+          dialCtx, cancel := context.WithTimeout(ctx, baseDialer.Timeout)
+          defer cancel()
+
+          type result struct {
+            conn net.Conn
+            err  error
+          }
+          resultCh := make(chan result, 1)
+
+          go func() {
+            conn, err := socksDialer.Dial(network, addr)
+            // 防泄漏核心逻辑：如果外层已经超时退出，立刻关闭迟来的连接
+            if dialCtx.Err() != nil && conn != nil {
+              conn.Close()
+              return
+            }
+            resultCh <- result{conn, err}
+          }()
+
+          select {
+          case <-dialCtx.Done():
+            return nil, dialCtx.Err()
+          case res := <-resultCh:
+            return res.conn, res.err
+          }
         }
+      } else if strings.HasPrefix(b.proxyURL, "http") {
+        transport.Proxy = http.ProxyURL(proxyURL)
+        transport.DialContext = baseDialer.DialContext
       }
-
-    case strings.HasPrefix(b.proxyURL, "http"):
-      // HTTP 代理：使用 Proxy 字段，保持原始 DialContext
-      transport.Proxy = http.ProxyURL(proxyURL)
+    } else {
       transport.DialContext = baseDialer.DialContext
-
-    default:
-      return nil
     }
-  } else {
-    // 无代理：直接使用 baseDialer
-    transport.DialContext = baseDialer.DialContext
-  }
 
-  // 4. 随机代理模式：禁用连接复用
-  if b.randomProxy {
-    transport.DisableKeepAlives = true
-    transport.MaxIdleConnsPerHost = 0
-    transport.MaxIdleConns = 0
-    transport.IdleConnTimeout = 0
-  }
-
-  // 5. 配置 TLS
-  if b.skipInsecure || len(b.caCert) > 0 {
-    tlsConfig := &tls.Config{
-      InsecureSkipVerify: b.skipInsecure,
+    // 处理 Transport 层面的随机代理配置
+    if b.randomProxy {
+      transport.DisableKeepAlives = true
+      transport.MaxIdleConnsPerHost = 0
+      transport.MaxIdleConns = 0
+      transport.IdleConnTimeout = 0
     }
-    if len(b.caCert) > 0 {
-      caCertPool := x509.NewCertPool()
-      if !caCertPool.AppendCertsFromPEM([]byte(b.caCert)) {
-        return nil // CA 证书解析失败
+
+    // 配置 TLS
+    if b.skipInsecure || len(b.caCert) > 0 {
+      tlsConfig := &tls.Config{
+        InsecureSkipVerify: b.skipInsecure,
       }
-      tlsConfig.RootCAs = caCertPool
+      if len(b.caCert) > 0 {
+        caCertPool := x509.NewCertPool()
+        if !caCertPool.AppendCertsFromPEM([]byte(b.caCert)) {
+          return nil, fmt.Errorf("failed to parse CA certificate") // CA 证书解析失败
+        }
+        tlsConfig.RootCAs = caCertPool
+      }
+      transport.TLSClientConfig = tlsConfig
     }
-    transport.TLSClientConfig = tlsConfig
-  }
 
-  return &http.Client{
-    Transport: transport,
-    Timeout:   b.timeout,
+    transportCache.Store(tKey, transport)
+    return transport, nil
+  })
+
+  if err != nil {
+    return nil, err
   }
+  return v.(*http.Transport), nil
 }
 
-func GetClient(opts ...ClientOption) *http.Client {
+func GetClient(opts ...ClientOption) (*http.Client, error) {
   builder := &clientBuilder{
     timeout:               60 * time.Second,
     responseHeaderTimeout: 15 * time.Second,
@@ -258,22 +308,36 @@ func GetClient(opts ...ClientOption) *http.Client {
     opt(builder)
   }
 
-  key := builder.key()
-
-  // 尝试从缓存获取
-  if client, ok := cache.clients.Load(key); ok {
-    return client.(*http.Client)
+  // 1. 获取高度复用的共享 Transport（底层 TCP 连接池）
+  sharedTransport, err := builder.getOrBuildTransport()
+  if err != nil {
+    return nil, fmt.Errorf("failed to build transport: %w", err)
   }
 
-  // 创建新客户端
-  client := builder.build()
-
-  // 缓存客户端
-  if existing, loaded := cache.clients.LoadOrStore(key, client); loaded {
-    return existing.(*http.Client)
+  // 2. 每次组装全新的 CookieJar（完全隔离不同调用的会话状态）
+  var jar *cookiejar.Jar
+  if builder.cookies != "" && builder.site != "" {
+    jar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+    domain, err := url.Parse(builder.site)
+    if err != nil {
+      return nil, fmt.Errorf("invalid site URL for cookies: %w", err)
+    }
+    cookies := transCookies(builder.cookies)
+    var httpCookies []*http.Cookie
+    for k, v := range cookies {
+      httpCookies = append(httpCookies, &http.Cookie{Name: k, Value: v})
+    }
+    jar.SetCookies(domain, httpCookies)
   }
 
-  return client
+  // 3. 返回全新外壳的 Client。轻量级对象，不用担心 GC 压力
+  client := &http.Client{
+    Transport: sharedTransport,
+    Timeout:   builder.timeout,
+    Jar:       jar,
+  }
+
+  return client, nil
 }
 
 func HttpHead(ctx context.Context, client *http.Client, p *HttpHeadParams) (*HttpHeadResp, error) {
@@ -432,8 +496,20 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   defer res.Body.Close()
 
   cookies := make(map[string]string)
-  for _, c := range res.Cookies() {
-    cookies[c.Name] = c.Value
+  // resp.Cookies() 拿的是“增量指令”：它只包含服务端在当前这一次请求中，要求客户端新建、修改或删除的 Cookie。
+  // jar.Cookies(url) 拿的是“全量状态”：它包含客户端当前针对该域名持有的所有处于有效期内的 Cookie 集合。
+  if client.Jar != nil {
+    domain, err := url.Parse(p.Url)
+    if err != nil {
+      return nil, fmt.Errorf("invalid site URL for cookies: %w", err)
+    }
+    for _, c := range client.Jar.Cookies(domain) {
+      cookies[c.Name] = c.Value
+    }
+  } else {
+    for _, c := range res.Cookies() {
+      cookies[c.Name] = c.Value
+    }
   }
 
   select {

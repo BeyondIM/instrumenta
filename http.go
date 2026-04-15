@@ -318,16 +318,31 @@ func GetClient(opts ...ClientOption) (*http.Client, error) {
   var jar http.CookieJar
   if builder.cookies != "" && builder.site != "" {
     jar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-    domain, err := url.Parse(builder.site)
+    domainURL, err := url.Parse(builder.site)
     if err != nil {
       return nil, fmt.Errorf("invalid site URL for cookies: %w", err)
     }
+    // 动态计算泛域名 (把 quark.cn 变成 .quark.cn)
+    // 注意：如果你的 site 本身传的是二级域名比如 pan.quark.cn，
+    // 这里加上点就是 .pan.quark.cn (仅对 pan 及其子域生效)。
+    // 建议 builder.site 统一传主域！
+    cookieDomain := "." + domainURL.Host
+    // 如果 Host 自带端口 (quark.cn:8080)，需要先剔除端口
+    if strings.Contains(cookieDomain, ":") {
+      cookieDomain = strings.Split(cookieDomain, ":")[0]
+    }
+
     cookies := transCookies(builder.cookies)
     var httpCookies []*http.Cookie
     for k, v := range cookies {
-      httpCookies = append(httpCookies, &http.Cookie{Name: k, Value: v})
+      httpCookies = append(httpCookies, &http.Cookie{
+        Name:   k,
+        Value:  v,
+        Domain: cookieDomain, // ✅ 强制指定泛域名属性
+        Path:   "/",          // ✅ 最佳实践：作用于全站路径
+      })
     }
-    jar.SetCookies(domain, httpCookies)
+    jar.SetCookies(domainURL, httpCookies)
   }
 
   // 3. 返回全新外壳的 Client。轻量级对象，不用担心 GC 压力

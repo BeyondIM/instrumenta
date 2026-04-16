@@ -39,7 +39,7 @@ type HTTPError struct {
 }
 
 type HttpHeadParams struct {
-  Header map[string]string
+  Header http.Header
   Url    string
 }
 
@@ -355,20 +355,18 @@ func GetClient(opts ...ClientOption) (*http.Client, error) {
 func HttpHead(ctx context.Context, client *http.Client, p *HttpHeadParams) (*HttpHeadResp, error) {
   req, err := http.NewRequestWithContext(ctx, "HEAD", p.Url, nil)
   if err != nil {
-    return &HttpHeadResp{}, err
+    return nil, err
   }
-  for k, v := range p.Header {
-    req.Header.Set(k, v)
-  }
+  req.Header = p.Header
   res, err := client.Do(req)
   if err != nil {
-    return &HttpHeadResp{}, err
+    return nil, err
   }
   defer res.Body.Close()
 
   select {
   case <-ctx.Done():
-    return &HttpHeadResp{}, ctx.Err()
+    return nil, ctx.Err()
   default:
   }
 

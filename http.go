@@ -40,6 +40,7 @@ type HTTPError struct {
 
 type HttpHeadParams struct {
   Header http.Header
+  Host   string
   Url    string
 }
 
@@ -64,6 +65,7 @@ type HttpGetResp struct {
 type HttpPostParams struct {
   Body     interface{}
   Header   http.Header
+  Host     string
   PostType string
   Url      string
 }
@@ -78,12 +80,14 @@ type HttpPostResp struct {
 type HttpPutParams struct {
   Body   interface{}
   Header http.Header
+  Host   string
   Url    string
 }
 
 type HttpDeleteParams struct {
   Body   interface{}
   Header http.Header
+  Host   string
   Url    string
 }
 
@@ -358,6 +362,10 @@ func HttpHead(ctx context.Context, client *http.Client, p *HttpHeadParams) (*Htt
     return nil, err
   }
   req.Header = p.Header
+  if len(p.Host) > 0 {
+    req.Host = p.Host
+  }
+
   res, err := client.Do(req)
   if err != nil {
     return nil, err
@@ -513,6 +521,9 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   }
   req.Header = p.Header
   req.Header.Set("Content-Type", contentType)
+  if len(p.Host) > 0 {
+    req.Host = p.Host
+  }
 
   res, err := client.Do(req)
   if err != nil {
@@ -579,6 +590,9 @@ func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte
   }
   req.Header = p.Header
   req.Header.Set("Content-Type", "application/json")
+  if len(p.Host) > 0 {
+    req.Host = p.Host
+  }
 
   res, err := client.Do(req)
   if err != nil {
@@ -621,7 +635,9 @@ func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) (
     return nil, err
   }
   req.Header = p.Header
-  req.Header.Set("Content-Type", "application/json")
+  if len(p.Host) > 0 {
+    req.Host = p.Host
+  }
 
   res, err := client.Do(req)
   if err != nil {

@@ -48,7 +48,7 @@ type HttpHeadResp struct {
 }
 
 type HttpGetParams struct {
-  Header       map[string]string
+  Header       http.Header
   Host         string
   Url          string
   SearchParams map[string]string
@@ -63,7 +63,7 @@ type HttpGetResp struct {
 
 type HttpPostParams struct {
   Body     interface{}
-  Header   map[string]string
+  Header   http.Header
   PostType string
   Url      string
 }
@@ -72,18 +72,18 @@ type HttpPostResp struct {
   StatusCode int
   Body       []byte
   RespHeader http.Header
-  Cookies    map[string]string
+  Cookies    []*http.Cookie
 }
 
 type HttpPutParams struct {
   Body   interface{}
-  Header map[string]string
+  Header http.Header
   Url    string
 }
 
 type HttpDeleteParams struct {
   Body   interface{}
-  Header map[string]string
+  Header http.Header
   Url    string
 }
 
@@ -391,9 +391,7 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
   if err != nil {
     return nil, err
   }
-  for k, v := range p.Header {
-    req.Header.Set(k, v)
-  }
+  req.Header = p.Header
   if len(p.Host) > 0 {
     req.Host = p.Host
   }
@@ -515,9 +513,7 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   if err != nil {
     return nil, err
   }
-  for k, v := range p.Header {
-    req.Header.Set(k, v)
-  }
+  req.Header = p.Header
   req.Header.Set("Content-Type", contentType)
 
   res, err := client.Do(req)
@@ -526,20 +522,16 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   }
   defer res.Body.Close()
 
-  cookies := make(map[string]string)
+  var cookies []*http.Cookie
   if client.Jar != nil {
     // resp.Cookies() 拿的是“增量指令”：它只包含服务端在当前这一次请求中，要求客户端新建、修改或删除的 Cookie。
     // jar.Cookies(url) 拿的是“全量状态”：它包含客户端当前针对该域名持有的所有处于有效期内的 Cookie 集合。
     domain, err := url.Parse(p.Url)
     if err == nil { // 这里最好别让 url.Parse 的报错阻断了主流程（走到这里说明请求已经成功了）
-      for _, c := range client.Jar.Cookies(domain) {
-        cookies[c.Name] = c.Value
-      }
+      cookies = client.Jar.Cookies(domain)
     }
   } else {
-    for _, c := range res.Cookies() {
-      cookies[c.Name] = c.Value
-    }
+    cookies = res.Cookies()
   }
 
   select {
@@ -587,9 +579,7 @@ func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte
   if err != nil {
     return nil, err
   }
-  for k, v := range p.Header {
-    req.Header.Set(k, v)
-  }
+  req.Header = p.Header
   req.Header.Set("Content-Type", "application/json")
 
   res, err := client.Do(req)
@@ -632,9 +622,7 @@ func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) (
   if err != nil {
     return nil, err
   }
-  for k, v := range p.Header {
-    req.Header.Set(k, v)
-  }
+  req.Header = p.Header
   req.Header.Set("Content-Type", "application/json")
 
   res, err := client.Do(req)

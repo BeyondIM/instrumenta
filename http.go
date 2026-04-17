@@ -104,6 +104,36 @@ type clientBuilder struct {
 }
 type ClientOption func(*clientBuilder)
 
+type CookieDeduplicateTransport struct {
+  Transport http.RoundTripper
+}
+
+func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+  cookieStr := req.Header.Get("Cookie")
+  if cookieStr != "" {
+    // 手动解析去重
+    parts := strings.Split(cookieStr, "; ")
+    seen := make(map[string]string)
+    for _, part := range parts {
+      kv := strings.SplitN(part, "=", 2)
+      if len(kv) == 2 {
+        // 后面的覆盖前面的
+        seen[kv[0]] = kv[1]
+      }
+    }
+
+    // 重新组装干净的 Cookie
+    var cleanCookies []string
+    for k, v := range seen {
+      cleanCookies = append(cleanCookies, k+"="+v)
+    }
+    req.Header.Set("Cookie", strings.Join(cleanCookies, "; "))
+  }
+
+  // 交给真实的底层发送
+  return t.Transport.RoundTrip(req)
+}
+
 // 实现 error 接口
 func (e *HTTPError) Error() string {
   if e.Message != "" {
@@ -304,7 +334,7 @@ func GetClient(opts ...ClientOption) (*http.Client, error) {
 
   // 返回全新外壳的 Client。轻量级对象，不用担心 GC 压力
   client := &http.Client{
-    Transport: sharedTransport,
+    Transport: &CookieDeduplicateTransport{Transport: sharedTransport},
     Timeout:   builder.timeout,
     Jar:       builder.sharedJar,
     CheckRedirect: func(req *http.Request, via []*http.Request) error {

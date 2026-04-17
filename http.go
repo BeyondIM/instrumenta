@@ -12,7 +12,6 @@ import (
   "mime/multipart"
   "net"
   "net/http"
-  "net/http/cookiejar"
   "net/url"
   "os"
   "path/filepath"
@@ -23,7 +22,6 @@ import (
 
   "github.com/bytedance/sonic"
   "golang.org/x/net/proxy"
-  "golang.org/x/net/publicsuffix"
   "golang.org/x/sync/singleflight"
 )
 
@@ -102,8 +100,7 @@ type clientBuilder struct {
   caCert                string
   proxyURL              string
   randomProxy           bool
-  site                  string
-  cookies               string
+  sharedJar             http.CookieJar
 }
 type ClientOption func(*clientBuilder)
 
@@ -147,10 +144,9 @@ func WithRandomProxy(proxyURL string) ClientOption {
   }
 }
 
-func WithCookies(site string, cookies string) ClientOption {
+func WithSharedJar(jar http.CookieJar) ClientOption {
   return func(b *clientBuilder) {
-    b.site = site
-    b.cookies = cookies
+    b.sharedJar = jar
   }
 }
 
@@ -300,50 +296,17 @@ func GetClient(opts ...ClientOption) (*http.Client, error) {
     opt(builder)
   }
 
-  // 1. 获取高度复用的共享 Transport（底层 TCP 连接池）
+  // 获取高度复用的共享 Transport（底层 TCP 连接池）
   sharedTransport, err := builder.getOrBuildTransport()
   if err != nil {
     return nil, fmt.Errorf("failed to build transport: %w", err)
   }
 
-  // 2. 每次组装全新的 CookieJar（完全隔离不同调用的会话状态）
-  var jar http.CookieJar
-  if builder.cookies != "" && builder.site != "" {
-    jar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-    domainURL, err := url.Parse(builder.site)
-    if err != nil {
-      return nil, fmt.Errorf("invalid site URL for cookies: %w", err)
-    }
-    // 动态计算泛域名 (把 quark.cn 变成 .quark.cn)
-    // 注意：如果你的 site 本身传的是二级域名比如 pan.quark.cn，
-    // 这里加上点就是 .pan.quark.cn (仅对 pan 及其子域生效)。
-    // 建议 builder.site 统一传主域！
-    cookieDomain := "." + domainURL.Host
-    // 如果 Host 自带端口 (quark.cn:8080)，需要先剔除端口
-    if strings.Contains(cookieDomain, ":") {
-      cookieDomain = strings.Split(cookieDomain, ":")[0]
-    }
-
-    // 伪造一个带有 Cookie Header 的 Request
-    req := &http.Request{Header: http.Header{"Cookie": []string{builder.cookies}}}
-    // 直接调用标准库的解析方法，拿到的就是完全合法的 []*http.Cookie
-    parsedCookies := req.Cookies()
-    // 遍历注入泛域名和 Path
-    var httpCookies []*http.Cookie
-    for _, c := range parsedCookies {
-      // 覆盖原有的属性
-      c.Domain = cookieDomain
-      c.Path = "/"
-      httpCookies = append(httpCookies, c)
-    }
-    jar.SetCookies(domainURL, httpCookies)
-  }
-
-  // 3. 返回全新外壳的 Client。轻量级对象，不用担心 GC 压力
+  // 返回全新外壳的 Client。轻量级对象，不用担心 GC 压力
   client := &http.Client{
     Transport: sharedTransport,
     Timeout:   builder.timeout,
-    Jar:       jar,
+    Jar:       builder.sharedJar,
     CheckRedirect: func(req *http.Request, via []*http.Request) error {
       if len(via) >= 10 { // 限制最大 10 次重定向，防止死循环
         // 返回 ErrUseLastResponse 不会产生 Error，而是让程序成功拿到最后的 3xx 响应

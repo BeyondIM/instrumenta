@@ -354,7 +354,11 @@ func HttpHead(ctx context.Context, client *http.Client, p *HttpHeadParams) (*Htt
   if err != nil {
     return nil, err
   }
-  req.Header = p.Header
+  if p.Header == nil {
+    req.Header = make(http.Header)
+  } else {
+    req.Header = p.Header
+  }
   if len(p.Host) > 0 {
     req.Host = p.Host
   }
@@ -390,7 +394,11 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
   if err != nil {
     return nil, err
   }
-  req.Header = p.Header
+  if p.Header == nil {
+    req.Header = make(http.Header)
+  } else {
+    req.Header = p.Header
+  }
   if len(p.Host) > 0 {
     req.Host = p.Host
   }
@@ -512,7 +520,11 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   if err != nil {
     return nil, err
   }
-  req.Header = p.Header
+  if p.Header == nil {
+    req.Header = make(http.Header)
+  } else {
+    req.Header = p.Header
+  }
   req.Header.Set("Content-Type", contentType)
   if len(p.Host) > 0 {
     req.Host = p.Host
@@ -581,7 +593,11 @@ func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte
   if err != nil {
     return nil, err
   }
-  req.Header = p.Header
+  if p.Header == nil {
+    req.Header = make(http.Header)
+  } else {
+    req.Header = p.Header
+  }
   req.Header.Set("Content-Type", "application/json")
   if len(p.Host) > 0 {
     req.Host = p.Host
@@ -627,7 +643,11 @@ func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) (
   if err != nil {
     return nil, err
   }
-  req.Header = p.Header
+  if p.Header == nil {
+    req.Header = make(http.Header)
+  } else {
+    req.Header = p.Header
+  }
   if len(p.Host) > 0 {
     req.Host = p.Host
   }

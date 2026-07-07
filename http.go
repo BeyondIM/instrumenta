@@ -195,31 +195,27 @@ func (b *clientBuilder) transportKey() string {
 func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
   tKey := b.transportKey()
 
-  // 1. 快速路径（Fast Path）：绝大多数情况都会在这里命中缓存直接返回
+  // 快速路径 (Fast Path)
   if t, ok := transportCache.Load(tKey); ok {
     return t.(*http.Transport), nil
   }
 
-  // 2. 慢速路径（Slow Path）：使用 singleflight 防止并发创建
-  // v 是 fn 返回的值，err 是错误，shared 表示是否被多个调用共享了结果
+  // 慢速路径 (Slow Path)：防止缓存击穿
   v, err, _ := sfGroup.Do(tKey, func() (interface{}, error) {
-    // 【重要】Double-Check (双重校验)：
-    // 因为在执行到这里之前，可能已经有其他 Goroutine 刚好完成了创建并存入了缓存。
+    // 双重校验 (Double-Check)
     if t, ok := transportCache.Load(tKey); ok {
       return t, nil
     }
 
+    // 基础拨号器配置
     baseDialer := &net.Dialer{
       Timeout:   10 * time.Second,
       KeepAlive: 30 * time.Second,
     }
 
-    // 随机代理模式：禁用连接复用
-    if b.randomProxy {
-      baseDialer.KeepAlive = 0
-    }
-
+    // ransport 基础配置
     transport := &http.Transport{
+      ForceAttemptHTTP2:     true, // 原生客户端强烈建议开启，提升并发性能
       ResponseHeaderTimeout: b.responseHeaderTimeout,
       TLSHandshakeTimeout:   10 * time.Second,
       IdleConnTimeout:       120 * time.Second,
@@ -228,25 +224,34 @@ func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
       MaxConnsPerHost:       50,
     }
 
+    // 处理随机代理模式：彻底禁用连接复用
+    if b.randomProxy {
+      baseDialer.KeepAlive = 0
+      transport.DisableKeepAlives = true
+      transport.MaxIdleConnsPerHost = 0
+      transport.MaxIdleConns = 0
+      transport.IdleConnTimeout = 0
+    }
+
+    // 代理路由与底层连接策略
     if b.proxyURL != "" {
       proxyURL, err := url.Parse(b.proxyURL)
       if err != nil {
         return nil, fmt.Errorf("invalid proxy URL: %w", err)
       }
+
       if strings.HasPrefix(b.proxyURL, "socks5") {
-        // proxy.Direct 是一个空的默认 Dialer，这意味着程序在连接 SOCKS5 代理服务器本身时，没有使用带有超时的 baseDialer，这可能导致在代理节点网络不通时，请求无限挂起。
         socksDialer, err := proxy.FromURL(proxyURL, baseDialer)
         if err != nil {
           return nil, fmt.Errorf("failed to create socks proxy dialer: %w", err)
         }
 
+        // 提取并封装 SOCKS5 防泄漏拨号逻辑
         transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-          // 优先尝试断言是否原生支持 Context
           if contextDialer, ok := socksDialer.(proxy.ContextDialer); ok {
             return contextDialer.DialContext(ctx, network, addr)
           }
 
-          // 手动处理 Goroutine 泄漏
           dialCtx, cancel := context.WithTimeout(ctx, baseDialer.Timeout)
           defer cancel()
 
@@ -258,7 +263,6 @@ func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
 
           go func() {
             conn, err := socksDialer.Dial(network, addr)
-            // 防泄漏核心逻辑：如果外层已经超时退出，立刻关闭迟来的连接
             if dialCtx.Err() != nil && conn != nil {
               conn.Close()
               return
@@ -274,36 +278,37 @@ func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
           }
         }
       } else if strings.HasPrefix(b.proxyURL, "http") {
+        // HTTP(S) 代理：使用原生 Proxy 字段，复用 baseDialer
         transport.Proxy = http.ProxyURL(proxyURL)
         transport.DialContext = baseDialer.DialContext
+      } else {
+        return nil, fmt.Errorf("unsupported proxy scheme in URL: %s", b.proxyURL)
       }
     } else {
+      // 无代理直连
       transport.DialContext = baseDialer.DialContext
     }
 
-    // 处理 Transport 层面的随机代理配置
-    if b.randomProxy {
-      transport.DisableKeepAlives = true
-      transport.MaxIdleConnsPerHost = 0
-      transport.MaxIdleConns = 0
-      transport.IdleConnTimeout = 0
-    }
-
-    // 配置 TLS
-    if b.skipInsecure || len(b.caCert) > 0 {
+    // --- TLS 配置 ---
+    if b.skipInsecure || b.caCert != "" {
       tlsConfig := &tls.Config{
         InsecureSkipVerify: b.skipInsecure,
       }
-      if len(b.caCert) > 0 {
+      if b.caCert != "" {
         caCertPool := x509.NewCertPool()
+        // 兼容处理：尝试作为 PEM 字符串解析，失败则尝试读取文件
         if !caCertPool.AppendCertsFromPEM([]byte(b.caCert)) {
-          return nil, fmt.Errorf("failed to parse CA certificate") // CA 证书解析失败
+          certData, err := os.ReadFile(b.caCert)
+          if err != nil || !caCertPool.AppendCertsFromPEM(certData) {
+            return nil, fmt.Errorf("failed to parse CA certificate from string or file")
+          }
         }
         tlsConfig.RootCAs = caCertPool
       }
       transport.TLSClientConfig = tlsConfig
     }
 
+    // 存入缓存并返回
     transportCache.Store(tKey, transport)
     return transport, nil
   })

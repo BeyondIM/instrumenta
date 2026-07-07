@@ -215,7 +215,6 @@ func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
 
     // ransport 基础配置
     transport := &http.Transport{
-      ForceAttemptHTTP2:     true, // 原生客户端强烈建议开启，提升并发性能
       ResponseHeaderTimeout: b.responseHeaderTimeout,
       TLSHandshakeTimeout:   10 * time.Second,
       IdleConnTimeout:       120 * time.Second,

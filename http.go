@@ -82,6 +82,13 @@ type HttpPutParams struct {
   Url    string
 }
 
+type HttpPatchParams struct {
+  Body   interface{}
+  Header http.Header
+  Host   string
+  Url    string
+}
+
 type HttpDeleteParams struct {
   Body   interface{}
   Header http.Header
@@ -586,6 +593,7 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
   }, nil
 }
 
+// PUT 语义是完整覆盖。需要在请求里提供资源的全部字段。如果漏掉某些字段，服务器可能会把它们清空或变成默认值
 func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte, error) {
   postBody := new(bytes.Buffer)
   body, err := sonic.Marshal(p.Body)
@@ -595,6 +603,64 @@ func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte
   postBody.Write(body)
 
   req, err := http.NewRequestWithContext(ctx, "PUT", p.Url, postBody)
+  if err != nil {
+    return nil, err
+  }
+  if p.Header == nil {
+    req.Header = make(http.Header)
+  } else {
+    req.Header = p.Header
+  }
+  req.Header.Set("Content-Type", "application/json")
+  if len(p.Host) > 0 {
+    req.Host = p.Host
+  }
+
+  res, err := client.Do(req)
+  if err != nil {
+    return nil, err
+  }
+  defer res.Body.Close()
+
+  select {
+  case <-ctx.Done():
+    return nil, ctx.Err()
+  default:
+  }
+
+  bodyBytes, err := io.ReadAll(res.Body)
+  if err != nil {
+    return nil, err
+  }
+
+  if res.StatusCode < 200 || res.StatusCode >= 300 {
+    var upstreamErr UpstreamErr
+    _ = json.Unmarshal(bodyBytes, &upstreamErr)
+
+    errMsg := upstreamErr.Error
+    if errMsg == "" {
+      errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(bodyBytes))
+    }
+    return nil, &HTTPError{
+      StatusCode: res.StatusCode,
+      Body:       bodyBytes,
+      Message:    errMsg,
+    }
+  }
+
+  return bodyBytes, nil
+}
+
+// PATCH 语义是部分修改。只需要在请求里提供发生变化的字段。没有提供的字段会保持原样，不会被删除。
+func HttpPatch(ctx context.Context, client *http.Client, p *HttpPatchParams) ([]byte, error) {
+  postBody := new(bytes.Buffer)
+  body, err := sonic.Marshal(p.Body)
+  if err != nil {
+    return nil, fmt.Errorf("failed to marshal json body: %w", err)
+  }
+  postBody.Write(body)
+
+  req, err := http.NewRequestWithContext(ctx, "PATCH", p.Url, postBody)
   if err != nil {
     return nil, err
   }

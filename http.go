@@ -5,7 +5,6 @@ import (
   "context"
   "crypto/tls"
   "crypto/x509"
-  "encoding/json"
   "fmt"
   "hash/fnv"
   "io"
@@ -434,7 +433,7 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
 
   if res.StatusCode < 200 || res.StatusCode >= 300 {
     var upstreamErr UpstreamErr
-    _ = json.Unmarshal(bodyBytes, &upstreamErr)
+    _ = sonic.Unmarshal(bodyBytes, &upstreamErr)
 
     errMsg := upstreamErr.Error
     if errMsg == "" {
@@ -573,7 +572,7 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
 
   if res.StatusCode < 200 || res.StatusCode >= 300 {
     var upstreamErr UpstreamErr
-    _ = json.Unmarshal(bodyBytes, &upstreamErr)
+    _ = sonic.Unmarshal(bodyBytes, &upstreamErr)
 
     errMsg := upstreamErr.Error
     if errMsg == "" {
@@ -635,7 +634,7 @@ func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte
 
   if res.StatusCode < 200 || res.StatusCode >= 300 {
     var upstreamErr UpstreamErr
-    _ = json.Unmarshal(bodyBytes, &upstreamErr)
+    _ = sonic.Unmarshal(bodyBytes, &upstreamErr)
 
     errMsg := upstreamErr.Error
     if errMsg == "" {
@@ -693,7 +692,7 @@ func HttpPatch(ctx context.Context, client *http.Client, p *HttpPatchParams) ([]
 
   if res.StatusCode < 200 || res.StatusCode >= 300 {
     var upstreamErr UpstreamErr
-    _ = json.Unmarshal(bodyBytes, &upstreamErr)
+    _ = sonic.Unmarshal(bodyBytes, &upstreamErr)
 
     errMsg := upstreamErr.Error
     if errMsg == "" {
@@ -742,7 +741,7 @@ func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) (
 
   if res.StatusCode < 200 || res.StatusCode >= 300 {
     var upstreamErr UpstreamErr
-    _ = json.Unmarshal(bodyBytes, &upstreamErr)
+    _ = sonic.Unmarshal(bodyBytes, &upstreamErr)
 
     errMsg := upstreamErr.Error
     if errMsg == "" {

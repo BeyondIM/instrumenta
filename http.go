@@ -57,6 +57,7 @@ type HttpGetResp struct {
   Location   string
   StatusCode int
   RespHeader http.Header
+  Cookies    []*http.Cookie
 }
 
 type HttpPostParams struct {
@@ -420,6 +421,16 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
   }
   defer res.Body.Close()
 
+  var cookies []*http.Cookie
+  if client.Jar != nil {
+    domain, err := url.Parse(p.Url)
+    if err == nil {
+      cookies = client.Jar.Cookies(domain)
+    }
+  } else {
+    cookies = res.Cookies()
+  }
+
   select {
   case <-ctx.Done():
     return nil, ctx.Err()
@@ -450,6 +461,7 @@ func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpG
     Location:   res.Request.URL.String(),
     Body:       bodyBytes,
     RespHeader: res.Header,
+    Cookies:    cookies,
   }, nil
 }
 

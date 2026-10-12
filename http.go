@@ -893,6 +893,17 @@ func GetClient(opts ...ClientOption) (*http.Client, error) {
   return client, nil
 }
 
+// WithJar 从已有 client 衍生出一个挂载新 CookieJar 的客户端副本。
+// 该副本与原 client 共享底层的网络 Transport 和长连接池，但拥有独立的 Cookie 会话状态。
+func WithJar(client *http.Client, jar http.CookieJar) *http.Client {
+  if client == nil {
+    return nil
+  }
+  cloned := *client
+  cloned.Jar = jar
+  return &cloned
+}
+
 // -------------------------------------------------------------
 // 核心请求执行引擎
 // -------------------------------------------------------------

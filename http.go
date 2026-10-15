@@ -348,6 +348,58 @@ type ClientOption func(*clientBuilder)
 // 中间件：多行/大小写不规范 Cookie 严格有序合并与去重
 // -------------------------------------------------------------
 
+// 判断是否为纯十六进制字符串（兼容碰巧全是 a-f 的 8 位/16 位/32 位 hex 后缀）
+func isHexSuffix(s string) bool {
+  if len(s) != 8 && len(s) != 16 && len(s) != 32 {
+    return false
+  }
+  for i := 0; i < len(s); i++ {
+    c := s[i]
+    if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+      return false
+    }
+  }
+  return true
+}
+
+// extractDynamicCookiePrefix 自动识别具有“统一前缀 + 动态后缀”特征的 Cookie 键名。
+// 例如：
+//   - "server_session_60bd140e" -> 返回 ("server_session_", true)
+//   - "csrf_1728912345"         -> 返回 ("csrf_", true)
+//   - "bbs_sid" / "bbs_token"   -> 后缀是纯字母单词，返回 ("", false)，互不覆盖！
+func extractDynamicCookiePrefix(k string) (string, bool) {
+  idx := strings.LastIndexByte(k, '_')
+  // 必须包含 '_'，且前缀和后缀都不能为空
+  if idx <= 0 || idx == len(k)-1 {
+    return "", false
+  }
+
+  suffix := k[idx+1:]
+  // 动态后缀通常至少 4 位（例如 8位 hex、时间戳、随机 ID）
+  if len(suffix) < 4 {
+    return "", false
+  }
+
+  hasDigit := false
+  for i := 0; i < len(suffix); i++ {
+    c := suffix[i]
+    if c >= '0' && c <= '9' {
+      hasDigit = true
+    } else if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+      // 包含非字母数字的特殊符号，不视为标准动态后缀
+      return "", false
+    }
+  }
+
+  // 核心判定：正常的固定字段名（如 bbs_sid, bbs_token, user_name）后缀是纯英文单词（无数字）；
+  // 而裂变出来的动态后缀（如 60bd140e, 9f8e7d6c, 17289912）几乎必然包含数字、符合定长 Hex，或是极长的随机串（>=16位）。
+  if hasDigit || isHexSuffix(suffix) || len(suffix) >= 16 {
+    return k[:idx+1], true
+  }
+
+  return "", false
+}
+
 type CookieDeduplicateTransport struct {
   Transport http.RoundTripper
 }
@@ -385,6 +437,8 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
   if len(cookieHeaders) > 0 {
     var keys []string
     seen := make(map[string]string)
+    // 记录动态前缀当前对应的最新完整 Key：prefix (如 "server_session_") -> fullKey (如 "server_session_60bd140e")
+    prefixLatestKey := make(map[string]string)
 
     for _, headerVal := range cookieHeaders {
       parts := strings.Split(headerVal, ";")
@@ -395,10 +449,23 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
         }
         kv := strings.SplitN(part, "=", 2)
         k := strings.TrimSpace(kv[0])
+        if k == "" {
+          continue
+        }
         v := ""
         if len(kv) == 2 {
-          v = kv[1]
+          v = strings.TrimSpace(kv[1])
         }
+
+        // 检测是否属于带动态后缀的同前缀 Cookie
+        if prefix, isDynamic := extractDynamicCookiePrefix(k); isDynamic {
+          if oldKey, exists := prefixLatestKey[prefix]; exists && oldKey != k {
+            // 删除之前同前缀的旧 Cookie
+            delete(seen, oldKey)
+          }
+          prefixLatestKey[prefix] = k
+        }
+
         if _, exists := seen[k]; !exists {
           keys = append(keys, k)
         }
@@ -407,11 +474,19 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
     }
 
     if len(keys) > 0 {
-      var cleanCookies []string
+      cleanCookies := make([]string, 0, len(seen))
       for _, k := range keys {
-        cleanCookies = append(cleanCookies, k+"="+seen[k])
+        val, ok := seen[k]
+        if !ok {
+          // 已被同前缀淘汰，或前面已经输出过，直接跳过
+          continue
+        }
+        delete(seen, k) // 输出后立即从 seen 中移除，天然防止 keys 中有重复项时二次输出
+        cleanCookies = append(cleanCookies, k+"="+val)
       }
-      reqClone.Header.Set("Cookie", strings.Join(cleanCookies, "; "))
+      if len(cleanCookies) > 0 {
+        reqClone.Header.Set("Cookie", strings.Join(cleanCookies, "; "))
+      }
     }
   }
 

@@ -1,1521 +1,841 @@
 package instrumenta
 
 import (
-  "bytes"
-  "container/list"
-  "context"
-  "crypto/sha256"
-  "crypto/tls"
-  "crypto/x509"
-  "encoding/hex"
-  "errors"
-  "fmt"
-  "io"
-  "mime"
-  "mime/multipart"
-  "net"
-  "net/http"
-  "net/url"
-  "os"
-  "path/filepath"
-  "sort"
-  "strconv"
-  "strings"
-  "sync"
-  "time"
-  "unicode/utf8"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-  "github.com/bytedance/sonic"
-  "golang.org/x/net/proxy"
-  "golang.org/x/sync/singleflight"
+	"github.com/bytedance/sonic"
+	"golang.org/x/net/proxy"
+	"golang.org/x/sync/singleflight"
 )
 
-const (
-  maxResponseBodyLimit = 64 << 20  // 正常响应体读取上限：64 MB
-  maxErrorBodyRetain   = 128 << 10 // 异常响应体最大保留上限：128 KB
-  maxErrorDrainBudget  = 512 << 10 // 异常响应体排空预算：最多额外读 512 KB 尝试复用 TCP 长连接
-  maxErrorMsgLen       = 512       // 错误消息最终 Rune 上限（包含截断后缀）
-  maxTransportCacheCap = 128       // Transport 缓存索引的最大条目数
-  maxCACacheCap        = 64        // CA 证书池缓存最大条目数
+const maxErrorMsgBodyLen = 512 // 错误信息中内嵌响应体的最大长度，防止巨型 HTML 报错页撑爆日志
+
+var (
+	transportCache sync.Map // Key: 网络配置哈希 -> Value: *http.Transport
+	sfGroup        singleflight.Group
 )
-
-// ErrUploadIncomplete 表示后台上传协程未能确认完全退出（例如调用方传入的 Reader 发生了不可中断的阻塞读取）。
-var ErrUploadIncomplete = errors.New("upload stream failed to confirm exit within timeout (goroutine may still be blocked in reader)")
-
-// ErrResponseReceivedUploadIncomplete 表示客户端已接收到 HTTP 响应，但本地上传流未能确认完整生产结束。
-type ErrResponseReceivedUploadIncomplete struct {
-  Resp       *HttpPostResp
-  RequestErr error
-  UploadErr  error
-}
-
-func (e *ErrResponseReceivedUploadIncomplete) Error() string {
-  status := 0
-  if e.Resp != nil {
-    status = e.Resp.StatusCode
-  }
-  var sb strings.Builder
-  fmt.Fprintf(&sb, "HTTP response received (status %d), but client upload stream was not confirmed complete", status)
-  if e.RequestErr != nil {
-    fmt.Fprintf(&sb, "; request error: %v", e.RequestErr)
-  }
-  if e.UploadErr != nil {
-    fmt.Fprintf(&sb, "; upload error: %v", e.UploadErr)
-  }
-  return sb.String()
-}
-
-func (e *ErrResponseReceivedUploadIncomplete) Unwrap() []error {
-  var errs []error
-  if e.RequestErr != nil {
-    errs = append(errs, e.RequestErr)
-  }
-  if e.UploadErr != nil {
-    errs = append(errs, e.UploadErr)
-  }
-  return errs
-}
-
-func safeTruncateUTF8(s string, maxRunes int) string {
-  if maxRunes <= 0 {
-    return ""
-  }
-
-  totalRunes := utf8.RuneCountInString(s)
-  if totalRunes <= maxRunes {
-    return s
-  }
-
-  const suffix = "...(truncated)"
-  suffixRunes := utf8.RuneCountInString(suffix)
-
-  if maxRunes <= suffixRunes {
-    var b strings.Builder
-    count := 0
-    for _, r := range suffix {
-      if count >= maxRunes {
-        break
-      }
-      b.WriteRune(r)
-      count++
-    }
-    return b.String()
-  }
-
-  keep := maxRunes - suffixRunes
-  var b strings.Builder
-
-  allocSize := 4096
-  if maxRunes <= 1024 {
-    allocSize = maxRunes * utf8.UTFMax
-  }
-  b.Grow(allocSize)
-
-  count := 0
-  for _, r := range s {
-    if count >= keep {
-      break
-    }
-    b.WriteRune(r)
-    count++
-  }
-  b.WriteString(suffix)
-  return b.String()
-}
-
-// -------------------------------------------------------------
-// 有界 CA 证书缓存
-// -------------------------------------------------------------
-
-type cachedCAPool struct {
-  fingerprint string
-  pool        *x509.CertPool
-}
-
-type boundedCACache struct {
-  mu       sync.Mutex
-  capacity int
-  items    map[string]*list.Element
-  evict    *list.List
-}
-
-var globalCACache = &boundedCACache{
-  capacity: maxCACacheCap,
-  items:    make(map[string]*list.Element),
-  evict:    list.New(),
-}
-
-func (c *boundedCACache) Get(fp string) (*cachedCAPool, bool) {
-  c.mu.Lock()
-  defer c.mu.Unlock()
-  if elem, ok := c.items[fp]; ok {
-    c.evict.MoveToFront(elem)
-    return elem.Value.(*cachedCAPool), true
-  }
-  return nil, false
-}
-
-func (c *boundedCACache) Put(entry *cachedCAPool) {
-  c.mu.Lock()
-  defer c.mu.Unlock()
-
-  if elem, ok := c.items[entry.fingerprint]; ok {
-    c.evict.MoveToFront(elem)
-    elem.Value = entry
-    return
-  }
-  if c.evict.Len() >= c.capacity {
-    oldest := c.evict.Back()
-    if oldest != nil {
-      c.evict.Remove(oldest)
-      kv := oldest.Value.(*cachedCAPool)
-      delete(c.items, kv.fingerprint)
-    }
-  }
-  elem := c.evict.PushFront(entry)
-  c.items[entry.fingerprint] = elem
-}
-
-// -------------------------------------------------------------
-// 带锁外闲置连接清理的有界 LRU 缓存
-// -------------------------------------------------------------
-
-type lruEntry struct {
-  key       string
-  transport *http.Transport
-}
-
-type boundedTransportCache struct {
-  mu       sync.Mutex
-  capacity int
-  items    map[string]*list.Element
-  evict    *list.List
-}
-
-var globalTransportCache = &boundedTransportCache{
-  capacity: maxTransportCacheCap,
-  items:    make(map[string]*list.Element),
-  evict:    list.New(),
-}
-
-func (c *boundedTransportCache) Get(key string) (*http.Transport, bool) {
-  c.mu.Lock()
-  defer c.mu.Unlock()
-
-  if elem, ok := c.items[key]; ok {
-    c.evict.MoveToFront(elem)
-    return elem.Value.(*lruEntry).transport, true
-  }
-  return nil, false
-}
-
-func (c *boundedTransportCache) Put(key string, t *http.Transport) {
-  var evictedTransport *http.Transport
-
-  c.mu.Lock()
-  if elem, ok := c.items[key]; ok {
-    c.evict.MoveToFront(elem)
-    entry := elem.Value.(*lruEntry)
-    old := entry.transport
-    entry.transport = t
-    c.mu.Unlock()
-
-    if old != nil && old != t {
-      old.CloseIdleConnections()
-    }
-    return
-  }
-
-  if c.evict.Len() >= c.capacity {
-    oldest := c.evict.Back()
-    if oldest != nil {
-      c.evict.Remove(oldest)
-      kv := oldest.Value.(*lruEntry)
-      delete(c.items, kv.key)
-      evictedTransport = kv.transport
-    }
-  }
-
-  elem := c.evict.PushFront(&lruEntry{key: key, transport: t})
-  c.items[key] = elem
-  c.mu.Unlock()
-
-  if evictedTransport != nil {
-    evictedTransport.CloseIdleConnections()
-  }
-}
-
-var sfGroup singleflight.Group
-
-// -------------------------------------------------------------
-// 错误与数据结构定义
-// -------------------------------------------------------------
 
 type HTTPError struct {
-  StatusCode    int
-  Body          []byte
-  Message       string
-  RespHeader    http.Header
-  BodyTruncated bool
+	StatusCode int
+	Body       []byte
+	Message    string
 }
 
 func (e *HTTPError) Error() string {
-  if e.Message != "" {
-    return e.Message
-  }
-  return fmt.Sprintf("HTTP request failed with status code %d", e.StatusCode)
-}
-
-type UpstreamErr struct {
-  Error string `json:"error"`
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("HTTP request failed with status code %d", e.StatusCode)
 }
 
 type HttpHeadParams struct {
-  Header http.Header
-  Host   string
-  Url    string
+	Header http.Header
+	Host   string
+	Url    string
 }
 
 type HttpHeadResp struct {
-  StatusCode int
-  RespHeader http.Header
+	StatusCode int
+	Location   string
+	RespHeader http.Header
 }
 
 type HttpGetParams struct {
-  Header       http.Header
-  Host         string
-  Url          string
-  SearchParams map[string]string
+	Header       http.Header
+	Host         string
+	Url          string
+	SearchParams map[string]string
 }
 
 type HttpGetResp struct {
-  Body       []byte
-  Location   string
-  StatusCode int
-  RespHeader http.Header
-  Cookies    []*http.Cookie
+	Body       []byte
+	Location   string
+	StatusCode int
+	RespHeader http.Header
+	Cookies    []*http.Cookie
 }
 
 type HttpPostParams struct {
-  Body     interface{}
-  Header   http.Header
-  Host     string
-  PostType string
-  Url      string
+	Body     interface{}
+	Header   http.Header
+	Host     string
+	PostType string
+	Url      string
 }
 
 type HttpPostResp struct {
-  StatusCode int
-  Body       []byte
-  RespHeader http.Header
-  Cookies    []*http.Cookie
+	StatusCode int
+	Body       []byte
+	RespHeader http.Header
+	Cookies    []*http.Cookie
 }
 
 type HttpPutParams struct {
-  Body   interface{}
-  Header http.Header
-  Host   string
-  Url    string
+	Body   interface{}
+	Header http.Header
+	Host   string
+	Url    string
 }
 
 type HttpPatchParams struct {
-  Body   interface{}
-  Header http.Header
-  Host   string
-  Url    string
+	Body   interface{}
+	Header http.Header
+	Host   string
+	Url    string
 }
 
 type HttpDeleteParams struct {
-  Header http.Header
-  Host   string
-  Url    string
+	Body   interface{}
+	Header http.Header
+	Host   string
+	Url    string
+}
+
+type UpstreamErr struct {
+	Error string `json:"error"`
 }
 
 type clientBuilder struct {
-  timeout               time.Duration
-  responseHeaderTimeout time.Duration
-  skipInsecure          bool
-  caCertPEM             string
-  caCertFile            string
-  proxyURL              string
-  rotatingProxy         bool
-  sharedJar             http.CookieJar
+	timeout               time.Duration
+	responseHeaderTimeout time.Duration
+	skipInsecure          bool
+	caCert                string
+	proxyURL              string
+	randomProxy           bool
+	sharedJar             http.CookieJar
 }
 
 type ClientOption func(*clientBuilder)
 
-// -------------------------------------------------------------
-// 中间件：多行/大小写不规范 Cookie 严格有序合并与去重
-// -------------------------------------------------------------
-
-// 判断是否为纯十六进制字符串（兼容碰巧全是 a-f 的 8 位/16 位/32 位 hex 后缀）
-func isHexSuffix(s string) bool {
-  if len(s) != 8 && len(s) != 16 && len(s) != 32 {
-    return false
-  }
-  for i := 0; i < len(s); i++ {
-    c := s[i]
-    if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-      return false
-    }
-  }
-  return true
-}
-
-// extractDynamicCookiePrefix 自动识别具有“统一前缀 + 动态后缀”特征的 Cookie 键名。
-// 例如：
-//   - "server_session_60bd140e" -> 返回 ("server_session_", true)
-//   - "csrf_1728912345"         -> 返回 ("csrf_", true)
-//   - "bbs_sid" / "bbs_token"   -> 后缀是纯字母单词，返回 ("", false)，互不覆盖！
-func extractDynamicCookiePrefix(k string) (string, bool) {
-  idx := strings.LastIndexByte(k, '_')
-  // 必须包含 '_'，且前缀和后缀都不能为空
-  if idx <= 0 || idx == len(k)-1 {
-    return "", false
-  }
-
-  suffix := k[idx+1:]
-  // 动态后缀通常至少 4 位（例如 8位 hex、时间戳、随机 ID）
-  if len(suffix) < 4 {
-    return "", false
-  }
-
-  hasDigit := false
-  for i := 0; i < len(suffix); i++ {
-    c := suffix[i]
-    if c >= '0' && c <= '9' {
-      hasDigit = true
-    } else if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-      // 包含非字母数字的特殊符号，不视为标准动态后缀
-      return "", false
-    }
-  }
-
-  // 核心判定：正常的固定字段名（如 bbs_sid, bbs_token, user_name）后缀是纯英文单词（无数字）；
-  // 而裂变出来的动态后缀（如 60bd140e, 9f8e7d6c, 17289912）几乎必然包含数字、符合定长 Hex，或是极长的随机串（>=16位）。
-  if hasDigit || isHexSuffix(suffix) || len(suffix) >= 16 {
-    return k[:idx+1], true
-  }
-
-  return "", false
-}
-
 type CookieDeduplicateTransport struct {
-  Transport http.RoundTripper
+	Transport http.RoundTripper
+}
+
+type cookieEntry struct {
+	key   string
+	val   string
+	hasEq bool
 }
 
 func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-  if req == nil {
-    return nil, errors.New("request cannot be nil")
-  }
-  if t.Transport == nil {
-    return nil, errors.New("underlying transport cannot be nil")
-  }
+	rt := t.Transport
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
 
-  reqClone := req.Clone(req.Context())
-  if req.Header != nil {
-    reqClone.Header = req.Header.Clone()
-  } else {
-    reqClone.Header = make(http.Header)
-  }
+	cookieHeaders := req.Header.Values("Cookie")
+	if len(cookieHeaders) > 0 {
+		seen := make(map[string]int)
+		var entries []cookieEntry
+		// 仅当存在多行 Cookie Header 或发现同名 Cookie 覆盖时，才触发克隆与重写
+		needRewrite := len(cookieHeaders) > 1
 
-  var cookieKeysToDelete []string
-  for k := range reqClone.Header {
-    if strings.EqualFold(k, "Cookie") {
-      cookieKeysToDelete = append(cookieKeysToDelete, k)
-    }
-  }
+		for _, cookieStr := range cookieHeaders {
+			parts := strings.Split(cookieStr, ";")
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				kv := strings.SplitN(part, "=", 2)
+				if len(kv) == 2 {
+					k, v := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+					if k == "" {
+						continue
+					}
+					if idx, exists := seen[k]; exists {
+						entries[idx].val = v // 后出现的同名 Cookie 覆盖前面的
+						entries[idx].hasEq = true
+						needRewrite = true
+					} else {
+						seen[k] = len(entries)
+						entries = append(entries, cookieEntry{key: k, val: v, hasEq: true})
+					}
+				} else {
+					// 兼容不含 "=" 的非标/Flag Cookie，避免被意外丢弃
+					k := part
+					if idx, exists := seen[k]; exists {
+						entries[idx] = cookieEntry{key: k, hasEq: false}
+						needRewrite = true
+					} else {
+						seen[k] = len(entries)
+						entries = append(entries, cookieEntry{key: k, hasEq: false})
+					}
+				}
+			}
+		}
 
-  sort.Strings(cookieKeysToDelete)
+		if needRewrite && len(entries) > 0 {
+			cleanCookies := make([]string, len(entries))
+			for i, e := range entries {
+				if e.hasEq {
+					cleanCookies[i] = e.key + "=" + e.val
+				} else {
+					cleanCookies[i] = e.key
+				}
+			}
+			// 遵守 http.RoundTripper 契约：仅在需要修改时克隆请求，绝不原地污染入参 req
+			reqCopy := req.Clone(req.Context())
+			reqCopy.Header.Set("Cookie", strings.Join(cleanCookies, "; "))
+			req = reqCopy
+		}
+	}
 
-  var cookieHeaders []string
-  for _, k := range cookieKeysToDelete {
-    cookieHeaders = append(cookieHeaders, reqClone.Header[k]...)
-    delete(reqClone.Header, k)
-  }
-
-  if len(cookieHeaders) > 0 {
-    var keys []string
-    seen := make(map[string]string)
-    // 记录动态前缀当前对应的最新完整 Key：prefix (如 "server_session_") -> fullKey (如 "server_session_60bd140e")
-    prefixLatestKey := make(map[string]string)
-
-    for _, headerVal := range cookieHeaders {
-      parts := strings.Split(headerVal, ";")
-      for _, part := range parts {
-        part = strings.TrimSpace(part)
-        if part == "" {
-          continue
-        }
-        kv := strings.SplitN(part, "=", 2)
-        k := strings.TrimSpace(kv[0])
-        if k == "" {
-          continue
-        }
-        v := ""
-        if len(kv) == 2 {
-          v = strings.TrimSpace(kv[1])
-        }
-
-        // 检测是否属于带动态后缀的同前缀 Cookie
-        if prefix, isDynamic := extractDynamicCookiePrefix(k); isDynamic {
-          if oldKey, exists := prefixLatestKey[prefix]; exists && oldKey != k {
-            // 删除之前同前缀的旧 Cookie
-            delete(seen, oldKey)
-          }
-          prefixLatestKey[prefix] = k
-        }
-
-        if _, exists := seen[k]; !exists {
-          keys = append(keys, k)
-        }
-        seen[k] = v
-      }
-    }
-
-    if len(keys) > 0 {
-      cleanCookies := make([]string, 0, len(seen))
-      for _, k := range keys {
-        val, ok := seen[k]
-        if !ok {
-          // 已被同前缀淘汰，或前面已经输出过，直接跳过
-          continue
-        }
-        delete(seen, k) // 输出后立即从 seen 中移除，天然防止 keys 中有重复项时二次输出
-        cleanCookies = append(cleanCookies, k+"="+val)
-      }
-      if len(cleanCookies) > 0 {
-        reqClone.Header.Set("Cookie", strings.Join(cleanCookies, "; "))
-      }
-    }
-  }
-
-  return t.Transport.RoundTrip(reqClone)
+	return rt.RoundTrip(req)
 }
-
-func normalizeContentType(h http.Header, defaultType string) error {
-  var keysToDelete []string
-  for k := range h {
-    if strings.EqualFold(k, "Content-Type") {
-      keysToDelete = append(keysToDelete, k)
-    }
-  }
-
-  if len(keysToDelete) == 0 {
-    if defaultType != "" {
-      h.Set("Content-Type", defaultType)
-    }
-    return nil
-  }
-
-  sort.Strings(keysToDelete)
-
-  var distinctValues []string
-  seenVal := make(map[string]struct{})
-
-  for _, k := range keysToDelete {
-    for _, val := range h[k] {
-      trimmed := strings.TrimSpace(val)
-      if trimmed == "" {
-        continue
-      }
-      if _, exists := seenVal[trimmed]; !exists {
-        seenVal[trimmed] = struct{}{}
-        distinctValues = append(distinctValues, trimmed)
-      }
-    }
-  }
-
-  if len(distinctValues) > 1 {
-    return fmt.Errorf("conflicting Content-Type headers specified: %v", distinctValues)
-  }
-
-  for _, k := range keysToDelete {
-    delete(h, k)
-  }
-
-  if len(distinctValues) == 1 {
-    h.Set("Content-Type", distinctValues[0])
-  } else if defaultType != "" {
-    h.Set("Content-Type", defaultType)
-  }
-
-  return nil
-}
-
-func reconcileMultipartContentType(h http.Header, actualBoundary string) error {
-  var keysToDelete []string
-  for k := range h {
-    if strings.EqualFold(k, "Content-Type") {
-      keysToDelete = append(keysToDelete, k)
-    }
-  }
-  sort.Strings(keysToDelete)
-
-  var distinctValues []string
-  seenVal := make(map[string]struct{})
-  for _, k := range keysToDelete {
-    for _, val := range h[k] {
-      trimmed := strings.TrimSpace(val)
-      if trimmed != "" {
-        if _, exists := seenVal[trimmed]; !exists {
-          seenVal[trimmed] = struct{}{}
-          distinctValues = append(distinctValues, trimmed)
-        }
-      }
-    }
-  }
-
-  if len(distinctValues) > 1 {
-    return fmt.Errorf("conflicting Content-Type headers specified for multipart request: %v", distinctValues)
-  }
-
-  if len(distinctValues) == 1 {
-    val := distinctValues[0]
-    mediaType, params, err := mime.ParseMediaType(val)
-    if err != nil {
-      return fmt.Errorf("invalid multipart Content-Type header '%s': %w", val, err)
-    }
-    if !strings.EqualFold(mediaType, "multipart/form-data") {
-      return fmt.Errorf("mismatched Content-Type '%s' for form-data request (must be multipart/form-data)", val)
-    }
-    if userBoundary, ok := params["boundary"]; ok && userBoundary != "" {
-      if userBoundary != actualBoundary {
-        return fmt.Errorf("custom boundary in Content-Type header ('%s') does not match actual multipart body boundary ('%s')", userBoundary, actualBoundary)
-      }
-    }
-  }
-
-  for _, k := range keysToDelete {
-    delete(h, k)
-  }
-
-  formattedType := mime.FormatMediaType("multipart/form-data", map[string]string{
-    "boundary": actualBoundary,
-  })
-  h.Set("Content-Type", formattedType)
-  return nil
-}
-
-// -------------------------------------------------------------
-// Options 配置函数
-// -------------------------------------------------------------
 
 func WithTimeout(timeout time.Duration) ClientOption {
-  return func(b *clientBuilder) {
-    if timeout < 0 {
-      timeout = 0
-    }
-    b.timeout = timeout
-  }
+	return func(b *clientBuilder) {
+		b.timeout = timeout
+	}
 }
 
 func WithResponseHeaderTimeout(responseHeaderTimeout time.Duration) ClientOption {
-  return func(b *clientBuilder) {
-    if responseHeaderTimeout < 0 {
-      responseHeaderTimeout = 0
-    }
-    b.responseHeaderTimeout = responseHeaderTimeout
-  }
+	return func(b *clientBuilder) {
+		b.responseHeaderTimeout = responseHeaderTimeout
+	}
 }
 
 func WithInsecureSkipVerify() ClientOption {
-  return func(b *clientBuilder) {
-    b.skipInsecure = true
-  }
+	return func(b *clientBuilder) {
+		b.skipInsecure = true
+	}
 }
 
-func WithCACert(certOrPath string) ClientOption {
-  return func(b *clientBuilder) {
-    if strings.Contains(certOrPath, "-----BEGIN CERTIFICATE-----") {
-      b.caCertPEM = certOrPath
-      b.caCertFile = ""
-    } else {
-      b.caCertFile = certOrPath
-      b.caCertPEM = ""
-    }
-  }
+func WithCACert(cert string) ClientOption {
+	return func(b *clientBuilder) {
+		b.caCert = cert
+	}
 }
 
 func WithFixedProxy(proxyURL string) ClientOption {
-  return func(b *clientBuilder) {
-    b.proxyURL = proxyURL
-    b.rotatingProxy = false
-  }
+	return func(b *clientBuilder) {
+		b.proxyURL = proxyURL
+		b.randomProxy = false
+	}
 }
 
 func WithRandomProxy(proxyURL string) ClientOption {
-  return func(b *clientBuilder) {
-    b.proxyURL = proxyURL
-    b.rotatingProxy = true
-  }
+	return func(b *clientBuilder) {
+		b.proxyURL = proxyURL
+		b.randomProxy = true
+	}
 }
 
 func WithSharedJar(jar http.CookieJar) ClientOption {
-  return func(b *clientBuilder) {
-    b.sharedJar = jar
-  }
+	return func(b *clientBuilder) {
+		b.sharedJar = jar
+	}
 }
 
-// -------------------------------------------------------------
-// 辅助与规范化
-// -------------------------------------------------------------
-
-func appendKeyField(dst *strings.Builder, s string) {
-  dst.WriteString(strconv.Itoa(len(s)))
-  dst.WriteByte(':')
-  dst.WriteString(s)
-}
-
-func isValidZoneID(zone string) bool {
-  if zone == "" {
-    return false
-  }
-  for i := 0; i < len(zone); i++ {
-    c := zone[i]
-    if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
-      return false
-    }
-  }
-  return true
-}
-
-func canonicalizeProxyURL(rawURL string) (string, error) {
-  if rawURL == "" {
-    return "", nil
-  }
-  u, err := url.Parse(rawURL)
-  if err != nil {
-    return "", fmt.Errorf("invalid proxy URL format: %w", err)
-  }
-
-  u.Fragment = ""
-
-  scheme := strings.ToLower(u.Scheme)
-  if scheme != "http" && scheme != "https" && scheme != "socks5" {
-    return "", fmt.Errorf("unsupported proxy scheme '%s': only http, https and socks5 are supported", u.Scheme)
-  }
-  u.Scheme = scheme
-
-  host := u.Hostname()
-  if host == "" {
-    return "", errors.New("proxy URL must contain a non-empty host")
-  }
-
-  portStr := u.Port()
-  var pNum int
-  if portStr != "" {
-    pNum, err = strconv.Atoi(portStr)
-    if err != nil || pNum <= 0 || pNum > 65535 {
-      return "", fmt.Errorf("invalid proxy port: %s", portStr)
-    }
-  }
-
-  isDefaultPort := (scheme == "http" && pNum == 80) || (scheme == "https" && pNum == 443)
-  if isDefaultPort {
-    pNum = 0
-  }
-
-  formattedPort := ""
-  if pNum > 0 {
-    formattedPort = strconv.Itoa(pNum)
-  }
-
-  if idx := strings.Index(host, "%"); idx != -1 {
-    ipPart := host[:idx]
-    zonePart := host[idx+1:]
-    if net.ParseIP(ipPart) == nil {
-      return "", fmt.Errorf("invalid IPv6 ip segment in zone: %s", ipPart)
-    }
-    if !isValidZoneID(zonePart) {
-      return "", fmt.Errorf("invalid IPv6 zone identifier: %s", zonePart)
-    }
-    encodedHost := "[" + ipPart + "%25" + zonePart + "]"
-    if formattedPort != "" {
-      u.Host = encodedHost + ":" + formattedPort
-    } else {
-      u.Host = encodedHost
-    }
-  } else if net.ParseIP(host) != nil {
-    if strings.Contains(host, ":") {
-      if formattedPort != "" {
-        u.Host = "[" + host + "]:" + formattedPort
-      } else {
-        u.Host = "[" + host + "]"
-      }
-    } else {
-      if formattedPort != "" {
-        u.Host = host + ":" + formattedPort
-      } else {
-        u.Host = host
-      }
-    }
-  } else {
-    host = strings.ToLower(host)
-    if formattedPort != "" {
-      u.Host = net.JoinHostPort(host, formattedPort)
-    } else {
-      u.Host = host
-    }
-  }
-
-  return u.String(), nil
-}
-
-func resolveCACertPool(pemData, filePath string) (*x509.CertPool, string, error) {
-  if pemData == "" && filePath == "" {
-    return nil, "", nil
-  }
-
-  var rawBytes []byte
-  if filePath != "" {
-    data, err := os.ReadFile(filePath)
-    if err != nil {
-      return nil, "", fmt.Errorf("read CA certificate file '%s': %w", filePath, err)
-    }
-    rawBytes = data
-  } else {
-    rawBytes = []byte(pemData)
-  }
-
-  h := sha256.Sum256(rawBytes)
-  fp := hex.EncodeToString(h[:])
-
-  if cached, ok := globalCACache.Get(fp); ok {
-    return cached.pool, cached.fingerprint, nil
-  }
-
-  pool, err := x509.SystemCertPool()
-  if err != nil {
-    return nil, "", fmt.Errorf("load system root CA pool: %w", err)
-  }
-  if pool == nil {
-    return nil, "", errors.New("load system root CA pool: returned nil pool")
-  }
-  if !pool.AppendCertsFromPEM(rawBytes) {
-    return nil, "", errors.New("failed to parse CA certificate from PEM data")
-  }
-
-  globalCACache.Put(&cachedCAPool{
-    fingerprint: fp,
-    pool:        pool,
-  })
-  return pool, fp, nil
-}
-
-func (b *clientBuilder) buildTransportKey(caFingerprint, canonProxy string) string {
-  var sb strings.Builder
-  appendKeyField(&sb, strconv.FormatInt(b.responseHeaderTimeout.Nanoseconds(), 10))
-  appendKeyField(&sb, strconv.FormatBool(b.skipInsecure))
-  appendKeyField(&sb, caFingerprint)
-  appendKeyField(&sb, canonProxy)
-  appendKeyField(&sb, strconv.FormatBool(b.rotatingProxy))
-  return sb.String()
+func (b *clientBuilder) transportKey() string {
+	h := fnv.New64a()
+	// 带长度前缀的格式化，彻底消除字符串内容包含分隔符引发的哈希碰撞
+	fmt.Fprintf(h, "%d|%t|%d:%s|%d:%s|%t",
+		b.responseHeaderTimeout,
+		b.skipInsecure,
+		len(b.caCert), b.caCert,
+		len(b.proxyURL), b.proxyURL,
+		b.randomProxy,
+	)
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
-  canonProxy, err := canonicalizeProxyURL(b.proxyURL)
-  if err != nil {
-    return nil, fmt.Errorf("canonicalize proxy URL: %w", err)
-  }
+	tKey := b.transportKey()
 
-  caPool, caFingerprint, err := resolveCACertPool(b.caCertPEM, b.caCertFile)
-  if err != nil {
-    return nil, fmt.Errorf("resolve CA certificates: %w", err)
-  }
+	// 快速路径 (Fast Path)
+	if t, ok := transportCache.Load(tKey); ok {
+		return t.(*http.Transport), nil
+	}
 
-  tKey := b.buildTransportKey(caFingerprint, canonProxy)
+	// 慢速路径 (Slow Path)：防止缓存击穿
+	v, err, _ := sfGroup.Do(tKey, func() (interface{}, error) {
+		if t, ok := transportCache.Load(tKey); ok {
+			return t, nil
+		}
 
-  if t, ok := globalTransportCache.Get(tKey); ok {
-    return t, nil
-  }
+		baseDialer := &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
 
-  v, err, _ := sfGroup.Do(tKey, func() (interface{}, error) {
-    if t, ok := globalTransportCache.Get(tKey); ok {
-      return t, nil
-    }
+		transport := &http.Transport{
+			ForceAttemptHTTP2:     true,
+			ResponseHeaderTimeout: b.responseHeaderTimeout,
+			TLSHandshakeTimeout:   10 * time.Second,
+			IdleConnTimeout:       120 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   20,
+			MaxConnsPerHost:       50,
+		}
 
-    baseDialer := &net.Dialer{
-      Timeout:   10 * time.Second,
-      KeepAlive: 30 * time.Second,
-    }
+		// 处理随机代理模式：彻底禁用连接池与 TCP KeepAlive
+		if b.randomProxy {
+			baseDialer.KeepAlive = -1
+			transport.DisableKeepAlives = true
+			transport.MaxIdleConnsPerHost = -1
+			transport.MaxIdleConns = 0
+			transport.IdleConnTimeout = 0
+		}
 
-    transport := &http.Transport{
-      ForceAttemptHTTP2:     !b.rotatingProxy,
-      ResponseHeaderTimeout: b.responseHeaderTimeout,
-      TLSHandshakeTimeout:   10 * time.Second,
-      IdleConnTimeout:       90 * time.Second,
-      MaxIdleConns:          100,
-      MaxIdleConnsPerHost:   20,
-      MaxConnsPerHost:       100,
-    }
+		// 代理路由与底层连接策略
+		if b.proxyURL != "" {
+			proxyURL, err := url.Parse(b.proxyURL)
+			if err != nil || proxyURL.Host == "" {
+				return nil, fmt.Errorf("invalid proxy URL %q: missing host or malformed", b.proxyURL)
+			}
 
-    if b.rotatingProxy {
-      baseDialer.KeepAlive = -1
-      transport.DisableKeepAlives = true
-    }
+			scheme := strings.ToLower(proxyURL.Scheme)
+			switch scheme {
+			case "socks5", "socks5h":
+				// golang.org/x/net/proxy 默认只注册了 "socks5"（且其底层默认即支持远端 DNS 解析，等同于 socks5h）
+				normalizedURL := *proxyURL
+				normalizedURL.Scheme = "socks5"
 
-    if canonProxy != "" {
-      parsedProxy, err := url.Parse(canonProxy)
-      if err != nil {
-        return nil, fmt.Errorf("parse canonical proxy URL: %w", err)
-      }
+				socksDialer, err := proxy.FromURL(&normalizedURL, baseDialer)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create socks proxy dialer: %w", err)
+				}
 
-      switch parsedProxy.Scheme {
-      case "socks5":
-        socksDialer, err := proxy.FromURL(parsedProxy, baseDialer)
-        if err != nil {
-          return nil, fmt.Errorf("create socks5 dialer: %w", err)
-        }
+				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					if contextDialer, ok := socksDialer.(proxy.ContextDialer); ok {
+						return contextDialer.DialContext(ctx, network, addr)
+					}
 
-        transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-          if contextDialer, ok := socksDialer.(proxy.ContextDialer); ok {
-            return contextDialer.DialContext(ctx, network, addr)
-          }
+					dialCtx, cancel := context.WithTimeout(ctx, baseDialer.Timeout)
+					defer cancel()
 
-          type dialResult struct {
-            conn net.Conn
-            err  error
-          }
-          ch := make(chan dialResult)
+					type result struct {
+						conn net.Conn
+						err  error
+					}
+					resultCh := make(chan result, 1)
 
-          go func() {
-            c, dErr := socksDialer.Dial(network, addr)
+					go func() {
+						conn, err := socksDialer.Dial(network, addr)
+						if dialCtx.Err() != nil {
+							if conn != nil {
+								_ = conn.Close()
+							}
+							return
+						}
+						resultCh <- result{conn, err}
+					}()
 
-            if ctx.Err() != nil {
-              if c != nil {
-                _ = c.Close()
-              }
-              return
-            }
+					select {
+					case <-dialCtx.Done():
+						return nil, dialCtx.Err()
+					case res := <-resultCh:
+						return res.conn, res.err
+					}
+				}
+			case "http", "https":
+				transport.Proxy = http.ProxyURL(proxyURL)
+				transport.DialContext = baseDialer.DialContext
+			default:
+				return nil, fmt.Errorf("unsupported proxy scheme in URL: %s", b.proxyURL)
+			}
+		} else {
+			transport.DialContext = baseDialer.DialContext
+		}
 
-            select {
-            case ch <- dialResult{conn: c, err: dErr}:
-            case <-ctx.Done():
-              if c != nil {
-                _ = c.Close()
-              }
-            }
-          }()
+		// --- TLS 配置 ---
+		if b.skipInsecure || b.caCert != "" {
+			tlsConfig := &tls.Config{
+				InsecureSkipVerify: b.skipInsecure,
+				MinVersion:         tls.VersionTLS12,
+				// 显式声明 ALPN 协议列表，防止自定义 DialContext + TLSConfig 下 HTTP/2 协商失效
+				NextProtos: []string{"h2", "http/1.1"},
+			}
+			if b.caCert != "" {
+				// 优先继承系统默认根证书池，避免配置自定义 CA 后无法访问常规公网 HTTPS
+				caCertPool, err := x509.SystemCertPool()
+				if err != nil || caCertPool == nil {
+					caCertPool = x509.NewCertPool()
+				}
+				if !caCertPool.AppendCertsFromPEM([]byte(b.caCert)) {
+					certData, err := os.ReadFile(b.caCert)
+					if err != nil || !caCertPool.AppendCertsFromPEM(certData) {
+						return nil, fmt.Errorf("failed to parse CA certificate from string or file")
+					}
+				}
+				tlsConfig.RootCAs = caCertPool
+			}
+			transport.TLSClientConfig = tlsConfig
+		}
 
-          select {
-          case <-ctx.Done():
-            return nil, ctx.Err()
-          case res := <-ch:
-            return res.conn, res.err
-          }
-        }
+		transportCache.Store(tKey, transport)
+		return transport, nil
+	})
 
-      case "http", "https":
-        transport.Proxy = http.ProxyURL(parsedProxy)
-        transport.DialContext = baseDialer.DialContext
-      }
-    } else {
-      transport.DialContext = baseDialer.DialContext
-    }
-
-    if b.skipInsecure || caPool != nil {
-      tlsConfig := &tls.Config{
-        InsecureSkipVerify: b.skipInsecure,
-      }
-      if caPool != nil {
-        tlsConfig.RootCAs = caPool
-      }
-      transport.TLSClientConfig = tlsConfig
-    }
-
-    globalTransportCache.Put(tKey, transport)
-    return transport, nil
-  })
-
-  if err != nil {
-    return nil, err
-  }
-  return v.(*http.Transport), nil
+	if err != nil {
+		return nil, err
+	}
+	return v.(*http.Transport), nil
 }
 
 func GetClient(opts ...ClientOption) (*http.Client, error) {
-  builder := &clientBuilder{
-    timeout:               60 * time.Second,
-    responseHeaderTimeout: 15 * time.Second,
-    rotatingProxy:         false,
-  }
+	builder := &clientBuilder{
+		timeout:               60 * time.Second,
+		responseHeaderTimeout: 15 * time.Second,
+		randomProxy:           false,
+	}
 
-  for _, opt := range opts {
-    if opt == nil {
-      return nil, errors.New("client option cannot be nil")
-    }
-    opt(builder)
-  }
+	for _, opt := range opts {
+		if opt != nil {
+			opt(builder)
+		}
+	}
 
-  sharedTransport, err := builder.getOrBuildTransport()
-  if err != nil {
-    return nil, fmt.Errorf("build transport: %w", err)
-  }
+	sharedTransport, err := builder.getOrBuildTransport()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build transport: %w", err)
+	}
 
-  client := &http.Client{
-    Transport: &CookieDeduplicateTransport{Transport: sharedTransport},
-    Timeout:   builder.timeout,
-    Jar:       builder.sharedJar,
-    CheckRedirect: func(req *http.Request, via []*http.Request) error {
-      if len(via) >= 10 {
-        return http.ErrUseLastResponse
-      }
-      return nil
-    },
-  }
+	client := &http.Client{
+		Transport: &CookieDeduplicateTransport{Transport: sharedTransport},
+		Timeout:   builder.timeout,
+		Jar:       builder.sharedJar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
 
-  return client, nil
+	return client, nil
 }
 
-// WithJar 从已有 client 衍生出一个挂载新 CookieJar 的客户端副本。
-// 该副本与原 client 共享底层的网络 Transport 和长连接池，但拥有独立的 Cookie 会话状态。
-func WithJar(client *http.Client, jar http.CookieJar) *http.Client {
-  if client == nil {
-    return nil
-  }
-  cloned := *client
-  cloned.Jar = jar
-  return &cloned
+// isNilPayload 判断 interface{} 是否为 nil 或值为 nil 的指针/接口
+func isNilPayload(v interface{}) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Ptr:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
 
-// -------------------------------------------------------------
-// 核心请求执行引擎
-// -------------------------------------------------------------
-
-func doExecute(client *http.Client, req *http.Request) ([]byte, *http.Response, error) {
-  res, err := client.Do(req)
-  if err != nil {
-    return nil, nil, err
-  }
-  defer res.Body.Close()
-
-  if res.StatusCode < 200 || res.StatusCode >= 300 {
-    limitedReader := io.LimitReader(res.Body, maxErrorBodyRetain+1)
-    errRawBytes, rErr := io.ReadAll(limitedReader)
-    if rErr != nil {
-      return nil, res, fmt.Errorf("read error response body (status %d): %w", res.StatusCode, rErr)
-    }
-
-    isTruncated := false
-    n := len(errRawBytes)
-    if n > maxErrorBodyRetain {
-      n = maxErrorBodyRetain
-      isTruncated = true
-    }
-    errBody := append([]byte(nil), errRawBytes[:n]...)
-
-    _, _ = io.CopyN(io.Discard, res.Body, maxErrorDrainBudget)
-
-    var upstreamErr UpstreamErr
-    _ = sonic.Unmarshal(errBody, &upstreamErr)
-
-    errMsg := upstreamErr.Error
-    if errMsg == "" {
-      snippetLen := len(errBody)
-      if snippetLen > 256 {
-        snippetLen = 256
-      }
-      errMsg = fmt.Sprintf("Upstream error (status %d): %s", res.StatusCode, string(errBody[:snippetLen]))
-    }
-    errMsg = safeTruncateUTF8(errMsg, maxErrorMsgLen)
-
-    return nil, res, &HTTPError{
-      StatusCode:    res.StatusCode,
-      Body:          errBody,
-      Message:       errMsg,
-      RespHeader:    res.Header.Clone(),
-      BodyTruncated: isTruncated,
-    }
-  }
-
-  bodyBytes, err := io.ReadAll(io.LimitReader(res.Body, maxResponseBodyLimit+1))
-  if err != nil {
-    return nil, nil, fmt.Errorf("read response body: %w", err)
-  }
-  if len(bodyBytes) > maxResponseBodyLimit {
-    return nil, nil, fmt.Errorf("response body exceeds limit of %d bytes", maxResponseBodyLimit)
-  }
-
-  return bodyBytes, res, nil
+// marshalJSONBody 智能序列化：兼容调用方直接传入 []byte / string / json.RawMessage，避免被二次 Base64 编码
+func marshalJSONBody(v interface{}) ([]byte, error) {
+	switch val := v.(type) {
+	case []byte:
+		return val, nil
+	case json.RawMessage:
+		return val, nil
+	case string:
+		return []byte(val), nil
+	default:
+		return sonic.Marshal(v)
+	}
 }
 
-// -------------------------------------------------------------
-// 外部调用方法
-// -------------------------------------------------------------
+// ensureContext 防止调用方传入 nil context 导致 http.NewRequestWithContext 触发 panic
+func ensureContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// applyRequestMeta 克隆 Header 并设置 Host 与 Content-Type
+func applyRequestMeta(req *http.Request, header http.Header, host, contentType string, forceContentType bool) {
+	if header != nil {
+		req.Header = header.Clone()
+	} else {
+		req.Header = make(http.Header)
+	}
+	if contentType != "" {
+		if forceContentType || req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+	}
+	if len(host) > 0 {
+		req.Host = host
+		req.Header.Del("Host")
+	} else if hdrHost := req.Header.Get("Host"); hdrHost != "" {
+		// 兼容调用方在 Header 中设置 Host 的习惯（Go 标准库默认忽略 req.Header["Host"]）
+		req.Host = hdrHost
+		req.Header.Del("Host")
+	}
+}
+
+// resolveLocation 解析响应的最终 URL：
+// 1. 若响应停留在 3xx 状态（如达到最大重定向次数触发 ErrUseLastResponse），提取并解析 Location 响应头；
+// 2. 若响应为 2xx（即使带有 Location 头，如 201 Created），返回当前请求实际落地的 URL。
+func resolveLocation(res *http.Response, fallbackURL string) string {
+	if res == nil {
+		return fallbackURL
+	}
+	if res.StatusCode >= 300 && res.StatusCode < 400 {
+		if loc := res.Header.Get("Location"); loc != "" {
+			if res.Request != nil && res.Request.URL != nil {
+				if resolved, err := res.Request.URL.Parse(loc); err == nil {
+					return resolved.String()
+				}
+			}
+			return loc
+		}
+	}
+	if res.Request != nil && res.Request.URL != nil {
+		return res.Request.URL.String()
+	}
+	return fallbackURL
+}
+
+// extractCookies 提取响应中的 Cookie（优先从 Jar 获取最终落地 URL 的全量有效 Cookie）
+func extractCookies(client *http.Client, res *http.Response, rawURL string) []*http.Cookie {
+	if client != nil && client.Jar != nil {
+		if res.Request != nil && res.Request.URL != nil {
+			return client.Jar.Cookies(res.Request.URL)
+		}
+		if u, err := url.Parse(rawURL); err == nil {
+			return client.Jar.Cookies(u)
+		}
+	}
+	return res.Cookies()
+}
+
+// checkStatusError 统一校验 HTTP 状态码（允许 2xx 和 ErrUseLastResponse 产生的 3xx）
+func checkStatusError(statusCode int, bodyBytes []byte) error {
+	if statusCode >= 200 && statusCode < 400 {
+		return nil
+	}
+	var upstreamErr UpstreamErr
+	if len(bodyBytes) > 0 {
+		_ = sonic.Unmarshal(bodyBytes, &upstreamErr)
+	}
+
+	errMsg := upstreamErr.Error
+	if errMsg == "" {
+		if len(bodyBytes) > 0 {
+			preview := bodyBytes
+			suffix := ""
+			if len(preview) > maxErrorMsgBodyLen {
+				preview = preview[:maxErrorMsgBodyLen]
+				suffix = "...(truncated)"
+			}
+			errMsg = fmt.Sprintf("Upstream error (status %d): %s%s", statusCode, string(preview), suffix)
+		} else {
+			errMsg = fmt.Sprintf("Upstream error (status %d)", statusCode)
+		}
+	}
+	return &HTTPError{
+		StatusCode: statusCode,
+		Body:       bodyBytes,
+		Message:    errMsg,
+	}
+}
 
 func HttpHead(ctx context.Context, client *http.Client, p *HttpHeadParams) (*HttpHeadResp, error) {
-  if client == nil {
-    return nil, errors.New("client cannot be nil")
-  }
-  if p == nil {
-    return nil, errors.New("params cannot be nil")
-  }
-  if ctx == nil {
-    ctx = context.Background()
-  }
+	if client == nil || p == nil {
+		return nil, errors.New("client and params must not be nil")
+	}
 
-  req, err := http.NewRequestWithContext(ctx, "HEAD", p.Url, nil)
-  if err != nil {
-    return nil, err
-  }
-  if p.Header != nil {
-    req.Header = p.Header.Clone()
-  }
-  if len(p.Host) > 0 {
-    req.Host = p.Host
-  }
+	req, err := http.NewRequestWithContext(ensureContext(ctx), http.MethodHead, p.Url, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyRequestMeta(req, p.Header, p.Host, "", false)
 
-  res, err := client.Do(req)
-  if err != nil {
-    return nil, err
-  }
-  defer res.Body.Close()
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, res.Body)
+		_ = res.Body.Close()
+	}()
 
-  if res.StatusCode < 200 || res.StatusCode >= 300 {
-    _, _ = io.CopyN(io.Discard, res.Body, maxErrorDrainBudget)
+	if err := checkStatusError(res.StatusCode, nil); err != nil {
+		return nil, err
+	}
 
-    return nil, &HTTPError{
-      StatusCode: res.StatusCode,
-      Message:    fmt.Sprintf("HEAD request failed with status code %d", res.StatusCode),
-      RespHeader: res.Header.Clone(),
-    }
-  }
-
-  return &HttpHeadResp{
-    StatusCode: res.StatusCode,
-    RespHeader: res.Header,
-  }, nil
+	return &HttpHeadResp{
+		StatusCode: res.StatusCode,
+		Location:   resolveLocation(res, p.Url),
+		RespHeader: res.Header,
+	}, nil
 }
 
 func HttpGet(ctx context.Context, client *http.Client, p *HttpGetParams) (*HttpGetResp, error) {
-  if client == nil {
-    return nil, errors.New("client cannot be nil")
-  }
-  if p == nil {
-    return nil, errors.New("params cannot be nil")
-  }
-  if ctx == nil {
-    ctx = context.Background()
-  }
+	if client == nil || p == nil {
+		return nil, errors.New("client and params must not be nil")
+	}
 
-  reqURL := p.Url
-  if len(p.SearchParams) > 0 {
-    u, err := url.Parse(p.Url)
-    if err != nil {
-      return nil, fmt.Errorf("parse request URL: %w", err)
-    }
-    query := u.Query()
-    for k, v := range p.SearchParams {
-      query.Set(k, v)
-    }
-    u.RawQuery = query.Encode()
-    reqURL = u.String()
-  }
+	reqURL := p.Url
+	if len(p.SearchParams) > 0 {
+		parsedURL, err := url.Parse(p.Url)
+		if err != nil {
+			return nil, fmt.Errorf("invalid url: %w", err)
+		}
+		q := parsedURL.Query()
+		for k, v := range p.SearchParams {
+			q.Set(k, v)
+		}
+		parsedURL.RawQuery = q.Encode()
+		reqURL = parsedURL.String()
+	}
 
-  req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-  if err != nil {
-    return nil, err
-  }
-  if p.Header != nil {
-    req.Header = p.Header.Clone()
-  }
-  if len(p.Host) > 0 {
-    req.Host = p.Host
-  }
+	req, err := http.NewRequestWithContext(ensureContext(ctx), http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyRequestMeta(req, p.Header, p.Host, "", false)
 
-  bodyBytes, res, err := doExecute(client, req)
-  if err != nil {
-    return nil, err
-  }
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
 
-  return &HttpGetResp{
-    Location:   res.Request.URL.String(),
-    StatusCode: res.StatusCode,
-    Body:       bodyBytes,
-    RespHeader: res.Header,
-    Cookies:    res.Cookies(),
-  }, nil
-}
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
 
-type uploadStatus struct {
-  err              error
-  producerFinished bool
-}
+	if err := checkStatusError(res.StatusCode, bodyBytes); err != nil {
+		return nil, err
+	}
 
-type formField struct {
-  key string
-  val interface{}
+	return &HttpGetResp{
+		StatusCode: res.StatusCode,
+		Location:   resolveLocation(res, reqURL),
+		Body:       bodyBytes,
+		RespHeader: res.Header,
+		Cookies:    extractCookies(client, res, reqURL),
+	}, nil
 }
 
 func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*HttpPostResp, error) {
-  if client == nil {
-    return nil, errors.New("client cannot be nil")
-  }
-  if p == nil {
-    return nil, errors.New("params cannot be nil")
-  }
-  if ctx == nil {
-    ctx = context.Background()
-  }
+	if client == nil || p == nil {
+		return nil, errors.New("client and params must not be nil")
+	}
 
-  headerClone := make(http.Header)
-  if p.Header != nil {
-    headerClone = p.Header.Clone()
-  }
+	var rawBody []byte
+	var contentType string
+	var forceContentType bool
 
-  var reqBody io.Reader
-  var pr *io.PipeReader
-  var pw *io.PipeWriter
-  var isStreaming bool
-  var streamingWriter *multipart.Writer
-  var uploadStatusChan chan uploadStatus
-  var frozenFields []formField
+	switch p.PostType {
+	case "form-urlencoded":
+		if p.Body != nil {
+			switch bodyVal := p.Body.(type) {
+			case map[string]string:
+				data := url.Values{}
+				for k, v := range bodyVal {
+					data.Set(k, v)
+				}
+				rawBody = []byte(data.Encode())
+			case url.Values:
+				rawBody = []byte(bodyVal.Encode())
+			default:
+				return nil, fmt.Errorf("form-urlencoded requires map[string]string or url.Values body, got %T", p.Body)
+			}
+		}
+		contentType = "application/x-www-form-urlencoded"
 
-  uploadCtx, cancelUpload := context.WithCancel(ctx)
-  defer cancelUpload()
+	case "form-data":
+		bodyMap, ok := p.Body.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("form-data requires map[string]interface{} body, got %T", p.Body)
+		}
+		buf := new(bytes.Buffer)
+		writer := multipart.NewWriter(buf)
+		for k, v := range bodyMap {
+			switch k {
+			case "media":
+				filePath, ok := v.(string)
+				if !ok {
+					return nil, fmt.Errorf("media field value must be a string path")
+				}
+				file, err := os.Open(filePath)
+				if err != nil {
+					return nil, fmt.Errorf("failed to open media file: %w", err)
+				}
+				part, err := writer.CreateFormFile(k, filepath.Base(file.Name()))
+				if err != nil {
+					_ = file.Close()
+					return nil, fmt.Errorf("failed to create form file: %w", err)
+				}
+				if _, err := io.Copy(part, file); err != nil {
+					_ = file.Close()
+					return nil, fmt.Errorf("failed to copy media file: %w", err)
+				}
+				_ = file.Close()
 
-  switch p.PostType {
-  case "form-urlencoded":
-    bodyMap, ok := p.Body.(map[string]string)
-    if !ok {
-      return nil, fmt.Errorf("form-urlencoded requires map[string]string body, got %T", p.Body)
-    }
-    data := url.Values{}
-    for k, v := range bodyMap {
-      data.Set(k, v)
-    }
-    reqBody = strings.NewReader(data.Encode())
-    if err := normalizeContentType(headerClone, "application/x-www-form-urlencoded"); err != nil {
-      return nil, err
-    }
+			case "bufMedia":
+				reader, ok := v.(io.Reader)
+				if !ok {
+					return nil, fmt.Errorf("bufMedia field value must implement io.Reader")
+				}
+				part, err := writer.CreateFormFile(k, "example.jpg")
+				if err != nil {
+					return nil, fmt.Errorf("failed to create form file for bufMedia: %w", err)
+				}
+				if _, err := io.Copy(part, reader); err != nil {
+					return nil, fmt.Errorf("failed to copy bufMedia: %w", err)
+				}
 
-  case "form-data":
-    bodyMap, ok := p.Body.(map[string]interface{})
-    if !ok {
-      return nil, fmt.Errorf("form-data requires map[string]interface{} body, got %T", p.Body)
-    }
+			default:
+				valStr, ok := v.(string)
+				if !ok {
+					return nil, fmt.Errorf("form-data field '%s' must be string, got %T", k, v)
+				}
+				if err := writer.WriteField(k, valStr); err != nil {
+					return nil, fmt.Errorf("failed to write form field '%s': %w", k, err)
+				}
+			}
+		}
+		if err := writer.Close(); err != nil {
+			return nil, err
+		}
+		rawBody = buf.Bytes()
+		contentType = writer.FormDataContentType()
+		forceContentType = true // multipart 必须使用带 boundary 的 Content-Type
 
-    keys := make([]string, 0, len(bodyMap))
-    for k := range bodyMap {
-      keys = append(keys, k)
-    }
-    sort.Strings(keys)
-    frozenFields = make([]formField, 0, len(keys))
-    for _, k := range keys {
-      frozenFields = append(frozenFields, formField{key: k, val: bodyMap[k]})
-    }
+	default:
+		if !isNilPayload(p.Body) {
+			body, err := marshalJSONBody(p.Body)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal json body: %w", err)
+			}
+			if len(body) > 0 {
+				rawBody = body
+				contentType = "application/json"
+			}
+		}
+	}
 
-    pr, pw = io.Pipe()
-    reqBody = pr
-    isStreaming = true
-    uploadStatusChan = make(chan uploadStatus, 1)
+	var bodyReader io.Reader
+	if len(rawBody) > 0 {
+		// 使用 bytes.NewReader 支持 307/308 重定向时自动重置读取流 (GetBody)
+		bodyReader = bytes.NewReader(rawBody)
+	} else {
+		bodyReader = http.NoBody
+	}
 
-    streamingWriter = multipart.NewWriter(pw)
+	req, err := http.NewRequestWithContext(ensureContext(ctx), http.MethodPost, p.Url, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	applyRequestMeta(req, p.Header, p.Host, contentType, forceContentType)
 
-    if err := reconcileMultipartContentType(headerClone, streamingWriter.Boundary()); err != nil {
-      _ = pr.CloseWithError(err)
-      _ = pw.CloseWithError(err)
-      return nil, err
-    }
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
 
-  default:
-    body, err := sonic.Marshal(p.Body)
-    if err != nil {
-      return nil, fmt.Errorf("marshal json body: %w", err)
-    }
-    reqBody = bytes.NewReader(body)
-    if err := normalizeContentType(headerClone, "application/json"); err != nil {
-      return nil, err
-    }
-  }
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
 
-  req, err := http.NewRequestWithContext(ctx, "POST", p.Url, reqBody)
-  if err != nil {
-    if isStreaming {
-      _ = pr.CloseWithError(err)
-      _ = pw.CloseWithError(err)
-    }
-    return nil, err
-  }
+	if err := checkStatusError(res.StatusCode, bodyBytes); err != nil {
+		return nil, err
+	}
 
-  req.Header = headerClone
-  if len(p.Host) > 0 {
-    req.Host = p.Host
-  }
-
-  if isStreaming {
-    writer := streamingWriter
-
-    go func() {
-      var writeErr error
-      var fullyFinished bool
-
-      defer func() {
-        if writeErr != nil {
-          _ = pw.CloseWithError(writeErr)
-        } else {
-          _ = pw.Close()
-        }
-        uploadStatusChan <- uploadStatus{
-          err:              writeErr,
-          producerFinished: fullyFinished,
-        }
-      }()
-
-      for _, f := range frozenFields {
-        k := f.key
-        v := f.val
-
-        select {
-        case <-uploadCtx.Done():
-          writeErr = uploadCtx.Err()
-          return
-        default:
-        }
-
-        switch k {
-        case "media":
-          filePath, ok := v.(string)
-          if !ok {
-            writeErr = fmt.Errorf("media field value must be a string path")
-            return
-          }
-          file, err := os.Open(filePath)
-          if err != nil {
-            writeErr = fmt.Errorf("open media file: %w", err)
-            return
-          }
-          part, err := writer.CreateFormFile(k, filepath.Base(file.Name()))
-          if err != nil {
-            _ = file.Close()
-            writeErr = fmt.Errorf("create form file: %w", err)
-            return
-          }
-          _, copyErr := io.Copy(part, file)
-          _ = file.Close()
-          if copyErr != nil {
-            writeErr = fmt.Errorf("stream media file: %w", copyErr)
-            return
-          }
-
-        case "bufMedia":
-          reader, ok := v.(io.Reader)
-          if !ok {
-            writeErr = fmt.Errorf("bufMedia field value must implement io.Reader")
-            return
-          }
-          part, err := writer.CreateFormFile(k, "buffer.bin")
-          if err != nil {
-            writeErr = fmt.Errorf("create form file for bufMedia: %w", err)
-            return
-          }
-
-          if _, err := io.Copy(part, reader); err != nil {
-            writeErr = fmt.Errorf("stream bufMedia: %w", err)
-            return
-          }
-
-        default:
-          valStr := fmt.Sprintf("%v", v)
-          if err := writer.WriteField(k, valStr); err != nil {
-            writeErr = fmt.Errorf("write form field '%s': %w", k, err)
-            return
-          }
-        }
-      }
-
-      if err := writer.Close(); err != nil {
-        writeErr = err
-      } else {
-        fullyFinished = true
-      }
-    }()
-  }
-
-  execClient := client
-  if isStreaming {
-    streamClient := *client
-    streamClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-      if len(via) > 0 {
-        return http.ErrUseLastResponse
-      }
-      return nil
-    }
-    execClient = &streamClient
-  }
-
-  bodyBytes, res, reqErr := doExecute(execClient, req)
-
-  cancelUpload()
-
-  if isStreaming {
-    if reqErr != nil {
-      _ = pr.CloseWithError(reqErr)
-    } else {
-      _ = pr.Close()
-    }
-
-    select {
-    case status := <-uploadStatusChan:
-      if !status.producerFinished {
-        var partialResp *HttpPostResp
-        if res != nil {
-          partialResp = &HttpPostResp{
-            StatusCode: res.StatusCode,
-            Body:       bodyBytes,
-            RespHeader: res.Header,
-            Cookies:    res.Cookies(),
-          }
-        }
-
-        uploadErr := status.err
-        if uploadErr == nil {
-          uploadErr = errors.New("upload stream was cut off before all fields and boundary were written")
-        } else {
-          uploadErr = fmt.Errorf("upload stream was cut off before completion: %w", uploadErr)
-        }
-
-        if partialResp != nil {
-          return nil, &ErrResponseReceivedUploadIncomplete{
-            Resp:       partialResp,
-            RequestErr: reqErr,
-            UploadErr:  uploadErr,
-          }
-        }
-
-        if reqErr != nil {
-          return nil, errors.Join(
-            fmt.Errorf("HTTP request failed: %w", reqErr),
-            uploadErr,
-          )
-        }
-        return nil, uploadErr
-      }
-
-      if reqErr != nil {
-        return nil, reqErr
-      }
-
-    case <-time.After(2 * time.Second):
-      if reqErr != nil {
-        return nil, errors.Join(
-          fmt.Errorf("HTTP request failed: %w", reqErr),
-          ErrUploadIncomplete,
-        )
-      }
-      return nil, ErrUploadIncomplete
-    }
-  }
-
-  if reqErr != nil {
-    return nil, reqErr
-  }
-
-  return &HttpPostResp{
-    StatusCode: res.StatusCode,
-    Body:       bodyBytes,
-    RespHeader: res.Header,
-    Cookies:    res.Cookies(),
-  }, nil
+	return &HttpPostResp{
+		StatusCode: res.StatusCode,
+		Body:       bodyBytes,
+		RespHeader: res.Header,
+		Cookies:    extractCookies(client, res, p.Url),
+	}, nil
 }
 
+// doJSONRequest 内部通用方法：处理 PUT / PATCH / DELETE 等带可选 JSON Body 的请求
+func doJSONRequest(ctx context.Context, client *http.Client, method, reqURL, host string, header http.Header, bodyPayload interface{}) ([]byte, error) {
+	if client == nil {
+		return nil, errors.New("client must not be nil")
+	}
+
+	var bodyReader io.Reader
+	var contentType string
+
+	if !isNilPayload(bodyPayload) {
+		body, err := marshalJSONBody(bodyPayload)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal json body: %w", err)
+		}
+		if len(body) > 0 {
+			bodyReader = bytes.NewReader(body)
+			contentType = "application/json"
+		}
+	}
+
+	if bodyReader == nil && (method == http.MethodPut || method == http.MethodPatch) {
+		bodyReader = http.NoBody
+	}
+
+	req, err := http.NewRequestWithContext(ensureContext(ctx), method, reqURL, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	applyRequestMeta(req, header, host, contentType, false)
+
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := checkStatusError(res.StatusCode, bodyBytes); err != nil {
+		return nil, err
+	}
+
+	return bodyBytes, nil
+}
+
+// HttpPut 语义是完整覆盖。需要在请求里提供资源的全部字段。
 func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte, error) {
-  if client == nil {
-    return nil, errors.New("client cannot be nil")
-  }
-  if p == nil {
-    return nil, errors.New("params cannot be nil")
-  }
-  if ctx == nil {
-    ctx = context.Background()
-  }
-
-  body, err := sonic.Marshal(p.Body)
-  if err != nil {
-    return nil, fmt.Errorf("marshal json body: %w", err)
-  }
-
-  req, err := http.NewRequestWithContext(ctx, "PUT", p.Url, bytes.NewReader(body))
-  if err != nil {
-    return nil, err
-  }
-  if p.Header != nil {
-    req.Header = p.Header.Clone()
-  } else {
-    req.Header = make(http.Header)
-  }
-  if err := normalizeContentType(req.Header, "application/json"); err != nil {
-    return nil, err
-  }
-
-  if len(p.Host) > 0 {
-    req.Host = p.Host
-  }
-
-  bodyBytes, _, err := doExecute(client, req)
-  return bodyBytes, err
+	if p == nil {
+		return nil, errors.New("params must not be nil")
+	}
+	return doJSONRequest(ctx, client, http.MethodPut, p.Url, p.Host, p.Header, p.Body)
 }
 
+// HttpPatch 语义是部分修改。只需要在请求里提供发生变化的字段。
 func HttpPatch(ctx context.Context, client *http.Client, p *HttpPatchParams) ([]byte, error) {
-  if client == nil {
-    return nil, errors.New("client cannot be nil")
-  }
-  if p == nil {
-    return nil, errors.New("params cannot be nil")
-  }
-  if ctx == nil {
-    ctx = context.Background()
-  }
-
-  body, err := sonic.Marshal(p.Body)
-  if err != nil {
-    return nil, fmt.Errorf("marshal json body: %w", err)
-  }
-
-  req, err := http.NewRequestWithContext(ctx, "PATCH", p.Url, bytes.NewReader(body))
-  if err != nil {
-    return nil, err
-  }
-  if p.Header != nil {
-    req.Header = p.Header.Clone()
-  } else {
-    req.Header = make(http.Header)
-  }
-  if err := normalizeContentType(req.Header, "application/json"); err != nil {
-    return nil, err
-  }
-
-  if len(p.Host) > 0 {
-    req.Host = p.Host
-  }
-
-  bodyBytes, _, err := doExecute(client, req)
-  return bodyBytes, err
+	if p == nil {
+		return nil, errors.New("params must not be nil")
+	}
+	return doJSONRequest(ctx, client, http.MethodPatch, p.Url, p.Host, p.Header, p.Body)
 }
 
+// HttpDelete 支持携带或不携带 JSON Body 的删除请求。
 func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) ([]byte, error) {
-  if client == nil {
-    return nil, errors.New("client cannot be nil")
-  }
-  if p == nil {
-    return nil, errors.New("params cannot be nil")
-  }
-  if ctx == nil {
-    ctx = context.Background()
-  }
-
-  req, err := http.NewRequestWithContext(ctx, "DELETE", p.Url, nil)
-  if err != nil {
-    return nil, err
-  }
-  if p.Header != nil {
-    req.Header = p.Header.Clone()
-  }
-  if len(p.Host) > 0 {
-    req.Host = p.Host
-  }
-
-  bodyBytes, _, err := doExecute(client, req)
-  return bodyBytes, err
+	if p == nil {
+		return nil, errors.New("params must not be nil")
+	}
+	return doJSONRequest(ctx, client, http.MethodDelete, p.Url, p.Host, p.Header, p.Body)
 }

@@ -136,6 +136,39 @@ type cookieEntry struct {
 	hasEq bool
 }
 
+// isHexBytes 检查字符串是否全为十六进制字符
+func isHexBytes(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDynamicTrashCookie(k string) bool {
+	validLens := map[int]bool{8: true, 16: true, 32: true, 40: true, 64: true}
+
+	// 情况 A：key 本身就是纯 8/16/32/40/64 位 Hex 串
+	if validLens[len(k)] && isHexBytes(k) {
+		return true
+	}
+
+	// 情况 B：key 带前缀，且后缀是 8/16/32/40/64 位 Hex 串 (如 server_session_60bd140e)
+	if idx := strings.Index(k, "_"); idx != -1 {
+		suffix := k[idx+1:]
+		if validLens[len(suffix)] && isHexBytes(suffix) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	rt := t.Transport
 	if rt == nil {
@@ -146,8 +179,12 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
 	if len(cookieHeaders) > 0 {
 		seen := make(map[string]int)
 		var entries []cookieEntry
-		// 仅当存在多行 Cookie Header 或发现同名 Cookie 覆盖时，才触发克隆与重写
 		needRewrite := len(cookieHeaders) > 1
+
+		// 用于归类“带前缀的动态 Cookie”（例如把所有的 server_session_ 归为同一类，只留最新一个）
+		prefixGroupIdx := make(map[string]int)
+		// 用于归类“纯随机 Hex Key 的 Cookie”（所有纯 Hex Key 共享一个槽位，只留最新一个）
+		pureHexSlotIdx := -1
 
 		for _, cookieStr := range cookieHeaders {
 			parts := strings.Split(cookieStr, ";")
@@ -162,8 +199,39 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
 					if k == "" {
 						continue
 					}
+
+					// 只根据 key 的特征拦截并折叠动态垃圾 Cookie ---
+					if isDynamicTrashCookie(k) {
+						needRewrite = true
+
+						// 细分规则 1：如果是带前缀的动态 Key（如 server_session_60bd140e）
+						if idx := strings.Index(k, "_"); idx != -1 {
+							prefix := k[:idx+1] // 例如 "server_session_"
+							if pIdx, exists := prefixGroupIdx[prefix]; exists {
+								// 后续变成了 server_session_abcdef，原地覆盖前一个同前缀的旧 Cookie
+								entries[pIdx] = cookieEntry{key: k, val: v, hasEq: true}
+								seen[k] = pIdx
+							} else {
+								prefixGroupIdx[prefix] = len(entries)
+								seen[k] = len(entries)
+								entries = append(entries, cookieEntry{key: k, val: v, hasEq: true})
+							}
+							continue
+						}
+
+						// 细分规则 2：如果是纯随机 Hex Key
+						if pureHexSlotIdx >= 0 {
+							entries[pureHexSlotIdx] = cookieEntry{key: k, val: v, hasEq: true}
+						} else {
+							pureHexSlotIdx = len(entries)
+							entries = append(entries, cookieEntry{key: k, val: v, hasEq: true})
+						}
+						continue
+					}
+
+					// 正常业务 Cookie：正常去重、后出现的覆盖前面的
 					if idx, exists := seen[k]; exists {
-						entries[idx].val = v // 后出现的同名 Cookie 覆盖前面的
+						entries[idx].val = v
 						entries[idx].hasEq = true
 						needRewrite = true
 					} else {
@@ -171,7 +239,6 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
 						entries = append(entries, cookieEntry{key: k, val: v, hasEq: true})
 					}
 				} else {
-					// 兼容不含 "=" 的非标/Flag Cookie，避免被意外丢弃
 					k := part
 					if idx, exists := seen[k]; exists {
 						entries[idx] = cookieEntry{key: k, hasEq: false}
@@ -184,18 +251,21 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
 			}
 		}
 
-		if needRewrite && len(entries) > 0 {
-			cleanCookies := make([]string, len(entries))
-			for i, e := range entries {
-				if e.hasEq {
-					cleanCookies[i] = e.key + "=" + e.val
-				} else {
-					cleanCookies[i] = e.key
-				}
-			}
-			// 遵守 http.RoundTripper 契约：仅在需要修改时克隆请求，绝不原地污染入参 req
+		if needRewrite {
 			reqCopy := req.Clone(req.Context())
-			reqCopy.Header.Set("Cookie", strings.Join(cleanCookies, "; "))
+			if len(entries) > 0 {
+				cleanCookies := make([]string, len(entries))
+				for i, e := range entries {
+					if e.hasEq {
+						cleanCookies[i] = e.key + "=" + e.val
+					} else {
+						cleanCookies[i] = e.key
+					}
+				}
+				reqCopy.Header.Set("Cookie", strings.Join(cleanCookies, "; "))
+			} else {
+				reqCopy.Header.Del("Cookie")
+			}
 			req = reqCopy
 		}
 	}
@@ -779,17 +849,17 @@ func HttpPost(ctx context.Context, client *http.Client, p *HttpPostParams) (*Htt
 	}, nil
 }
 
-// doJSONRequest 内部通用方法：处理 PUT / PATCH / DELETE 等带可选 JSON Body 的请求
-func doJSONRequest(ctx context.Context, client *http.Client, method, reqURL, host string, header http.Header, bodyPayload interface{}) ([]byte, error) {
-	if client == nil {
-		return nil, errors.New("client must not be nil")
+// HttpPut 语义是完整覆盖。需要在请求里提供资源的全部字段。如果漏掉某些字段，服务器可能会把它们清空或变成默认值。
+func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte, error) {
+	if client == nil || p == nil {
+		return nil, errors.New("client and params must not be nil")
 	}
 
-	var bodyReader io.Reader
+	var bodyReader io.Reader = http.NoBody
 	var contentType string
 
-	if !isNilPayload(bodyPayload) {
-		body, err := marshalJSONBody(bodyPayload)
+	if !isNilPayload(p.Body) {
+		body, err := marshalJSONBody(p.Body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal json body: %w", err)
 		}
@@ -799,15 +869,11 @@ func doJSONRequest(ctx context.Context, client *http.Client, method, reqURL, hos
 		}
 	}
 
-	if bodyReader == nil && (method == http.MethodPut || method == http.MethodPatch) {
-		bodyReader = http.NoBody
-	}
-
-	req, err := http.NewRequestWithContext(ensureContext(ctx), method, reqURL, bodyReader)
+	req, err := http.NewRequestWithContext(ensureContext(ctx), http.MethodPut, p.Url, bodyReader)
 	if err != nil {
 		return nil, err
 	}
-	applyRequestMeta(req, header, host, contentType, false)
+	applyRequestMeta(req, p.Header, p.Host, contentType, false)
 
 	res, err := client.Do(req)
 	if err != nil {
@@ -827,26 +893,90 @@ func doJSONRequest(ctx context.Context, client *http.Client, method, reqURL, hos
 	return bodyBytes, nil
 }
 
-// HttpPut 语义是完整覆盖。需要在请求里提供资源的全部字段。
-func HttpPut(ctx context.Context, client *http.Client, p *HttpPutParams) ([]byte, error) {
-	if p == nil {
-		return nil, errors.New("params must not be nil")
-	}
-	return doJSONRequest(ctx, client, http.MethodPut, p.Url, p.Host, p.Header, p.Body)
-}
-
-// HttpPatch 语义是部分修改。只需要在请求里提供发生变化的字段。
+// HttpPatch 语义是部分修改。只需要在请求里提供发生变化的字段。没有提供的字段会保持原样，不会被删除。
 func HttpPatch(ctx context.Context, client *http.Client, p *HttpPatchParams) ([]byte, error) {
-	if p == nil {
-		return nil, errors.New("params must not be nil")
+	if client == nil || p == nil {
+		return nil, errors.New("client and params must not be nil")
 	}
-	return doJSONRequest(ctx, client, http.MethodPatch, p.Url, p.Host, p.Header, p.Body)
+
+	var bodyReader io.Reader = http.NoBody
+	var contentType string
+
+	if !isNilPayload(p.Body) {
+		body, err := marshalJSONBody(p.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal json body: %w", err)
+		}
+		if len(body) > 0 {
+			bodyReader = bytes.NewReader(body)
+			contentType = "application/json"
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ensureContext(ctx), http.MethodPatch, p.Url, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	applyRequestMeta(req, p.Header, p.Host, contentType, false)
+
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := checkStatusError(res.StatusCode, bodyBytes); err != nil {
+		return nil, err
+	}
+
+	return bodyBytes, nil
 }
 
 // HttpDelete 支持携带或不携带 JSON Body 的删除请求。
 func HttpDelete(ctx context.Context, client *http.Client, p *HttpDeleteParams) ([]byte, error) {
-	if p == nil {
-		return nil, errors.New("params must not be nil")
+	if client == nil || p == nil {
+		return nil, errors.New("client and params must not be nil")
 	}
-	return doJSONRequest(ctx, client, http.MethodDelete, p.Url, p.Host, p.Header, p.Body)
+
+	var bodyReader io.Reader
+	var contentType string
+
+	if !isNilPayload(p.Body) {
+		body, err := marshalJSONBody(p.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal json body: %w", err)
+		}
+		if len(body) > 0 {
+			bodyReader = bytes.NewReader(body)
+			contentType = "application/json"
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ensureContext(ctx), http.MethodDelete, p.Url, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	applyRequestMeta(req, p.Header, p.Host, contentType, false)
+
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := checkStatusError(res.StatusCode, bodyBytes); err != nil {
+		return nil, err
+	}
+
+	return bodyBytes, nil
 }

@@ -150,23 +150,38 @@ func isHexBytes(s string) bool {
 	return true
 }
 
-func isDynamicTrashCookie(k string) bool {
-	validLens := map[int]bool{8: true, 16: true, 32: true, 40: true, 64: true}
-
-	// 情况 A：key 本身就是纯 8/16/32/40/64 位 Hex 串
-	if validLens[len(k)] && isHexBytes(k) {
+// isDynamicHexLen 判断长度是否为常见的随机 Hex 长度（避免创建 map 产生堆内存分配）
+func isDynamicHexLen(n int) bool {
+	switch n {
+	case 8, 16, 32, 40, 64:
 		return true
+	default:
+		return false
+	}
+}
+
+// classifyCookie 判断 Cookie Key 的类型并生成独立的归类组标识：
+// 返回值: (是否为动态垃圾Cookie, 归类组标识)
+// - 普通业务 Cookie (如 "bbs_sid"): 返回 (false, "")
+// - 16位纯随机 Hex Key: 返回 (true, "__PURE_HEX_16__")
+// - 32位纯随机 Hex Key: 返回 (true, "__PURE_HEX_32__")
+// - 带前缀的随机 Hex Key (如 "server_session_60bd140e"): 返回 (true, "prefix:server_session_8")
+func classifyCookie(k string) (bool, string) {
+	// 情况 A：key 本身就是纯 8/16/32/40/64 位 Hex 串
+	// 按不同长度分别生成 groupKey，确保 16 位和 32 位各自独立保留最后一个
+	if isDynamicHexLen(len(k)) && isHexBytes(k) {
+		return true, "__PURE_HEX_" + strconv.Itoa(len(k)) + "__"
 	}
 
-	// 情况 B：key 带前缀，且后缀是 8/16/32/40/64 位 Hex 串 (如 server_session_60bd140e)
-	if idx := strings.Index(k, "_"); idx != -1 {
+	// 情况 B：key 带下划线前缀，且最后一个下划线后的后缀是 8/16/32/40/64 位 Hex 串
+	if idx := strings.LastIndex(k, "_"); idx != -1 {
 		suffix := k[idx+1:]
-		if validLens[len(suffix)] && isHexBytes(suffix) {
-			return true
+		if isDynamicHexLen(len(suffix)) && isHexBytes(suffix) {
+			return true, "prefix:" + k[:idx+1] + strconv.Itoa(len(suffix))
 		}
 	}
 
-	return false
+	return false, ""
 }
 
 func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -175,16 +190,15 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
 		rt = http.DefaultTransport
 	}
 
+	// 记录本次请求中被判定为“已被淘汰的旧动态 Cookie 名称”，用于在响应返回时通知 CookieJar 删除它们
+	var evictedKeys []string
+
 	cookieHeaders := req.Header.Values("Cookie")
 	if len(cookieHeaders) > 0 {
 		seen := make(map[string]int)
+		dynamicGroupIdx := make(map[string]int) // groupKey -> entries index
 		var entries []cookieEntry
 		needRewrite := len(cookieHeaders) > 1
-
-		// 用于归类“带前缀的动态 Cookie”（例如把所有的 server_session_ 归为同一类，只留最新一个）
-		prefixGroupIdx := make(map[string]int)
-		// 用于归类“纯随机 Hex Key 的 Cookie”（所有纯 Hex Key 共享一个槽位，只留最新一个）
-		pureHexSlotIdx := -1
 
 		for _, cookieStr := range cookieHeaders {
 			parts := strings.Split(cookieStr, ";")
@@ -200,36 +214,26 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
 						continue
 					}
 
-					// 只根据 key 的特征拦截并折叠动态垃圾 Cookie ---
-					if isDynamicTrashCookie(k) {
+					// 1. 检查是否为动态生成的 Hex Cookie（纯 Hex 或带前缀 Hex）
+					if isDyn, groupKey := classifyCookie(k); isDyn {
 						needRewrite = true
-
-						// 细分规则 1：如果是带前缀的动态 Key（如 server_session_60bd140e）
-						if idx := strings.Index(k, "_"); idx != -1 {
-							prefix := k[:idx+1] // 例如 "server_session_"
-							if pIdx, exists := prefixGroupIdx[prefix]; exists {
-								// 后续变成了 server_session_abcdef，原地覆盖前一个同前缀的旧 Cookie
-								entries[pIdx] = cookieEntry{key: k, val: v, hasEq: true}
-								seen[k] = pIdx
-							} else {
-								prefixGroupIdx[prefix] = len(entries)
-								seen[k] = len(entries)
-								entries = append(entries, cookieEntry{key: k, val: v, hasEq: true})
+						if gIdx, exists := dynamicGroupIdx[groupKey]; exists {
+							// 存在同组旧的动态 Cookie：记录旧 key 以便稍后从 Jar 中物理清除，并用新 key 覆盖槽位
+							oldKey := entries[gIdx].key
+							if oldKey != k {
+								evictedKeys = append(evictedKeys, oldKey)
 							}
-							continue
-						}
-
-						// 细分规则 2：如果是纯随机 Hex Key
-						if pureHexSlotIdx >= 0 {
-							entries[pureHexSlotIdx] = cookieEntry{key: k, val: v, hasEq: true}
+							entries[gIdx] = cookieEntry{key: k, val: v, hasEq: true}
+							seen[k] = gIdx
 						} else {
-							pureHexSlotIdx = len(entries)
+							dynamicGroupIdx[groupKey] = len(entries)
+							seen[k] = len(entries)
 							entries = append(entries, cookieEntry{key: k, val: v, hasEq: true})
 						}
 						continue
 					}
 
-					// 正常业务 Cookie：正常去重、后出现的覆盖前面的
+					// 2. 正常业务 Cookie：同名后面覆盖前面
 					if idx, exists := seen[k]; exists {
 						entries[idx].val = v
 						entries[idx].hasEq = true
@@ -270,7 +274,23 @@ func (t *CookieDeduplicateTransport) RoundTrip(req *http.Request) (*http.Respons
 		}
 	}
 
-	return rt.RoundTrip(req)
+	res, err := rt.RoundTrip(req)
+	if err != nil || res == nil {
+		return res, err
+	}
+
+	// 如果存在被淘汰的旧动态 Cookie，在响应头中追加 Max-Age=0 过期指令，
+	// 这样当 RoundTrip 返回后，http.Client 会自动将它们从 client.Jar 中永久删除！
+	if len(evictedKeys) > 0 {
+		if res.Header == nil {
+			res.Header = make(http.Header)
+		}
+		for _, oldKey := range evictedKeys {
+			res.Header.Add("Set-Cookie", oldKey+"=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+		}
+	}
+
+	return res, nil
 }
 
 func WithTimeout(timeout time.Duration) ClientOption {
@@ -589,17 +609,51 @@ func resolveLocation(res *http.Response, fallbackURL string) string {
 	return fallbackURL
 }
 
-// extractCookies 提取响应中的 Cookie（优先从 Jar 获取最终落地 URL 的全量有效 Cookie）
+// extractCookies 提取响应中的 Cookie，并折叠动态垃圾 Cookie（每种动态类型只保留最新 1 个）
 func extractCookies(client *http.Client, res *http.Response, rawURL string) []*http.Cookie {
+	var rawCookies []*http.Cookie
 	if client != nil && client.Jar != nil {
 		if res.Request != nil && res.Request.URL != nil {
-			return client.Jar.Cookies(res.Request.URL)
+			rawCookies = client.Jar.Cookies(res.Request.URL)
+		} else if u, err := url.Parse(rawURL); err == nil {
+			rawCookies = client.Jar.Cookies(u)
 		}
-		if u, err := url.Parse(rawURL); err == nil {
-			return client.Jar.Cookies(u)
+	} else if res != nil {
+		rawCookies = res.Cookies()
+	}
+
+	if len(rawCookies) == 0 {
+		return rawCookies
+	}
+
+	// 对提取出的 Cookie 列表执行同样的去重与动态折叠，确保返回给调用方的列表永远干净
+	seen := make(map[string]int)
+	dynamicGroupIdx := make(map[string]int)
+	result := make([]*http.Cookie, 0, len(rawCookies))
+
+	for _, c := range rawCookies {
+		if c == nil || c.Name == "" {
+			continue
+		}
+		if isDyn, groupKey := classifyCookie(c.Name); isDyn {
+			if gIdx, exists := dynamicGroupIdx[groupKey]; exists {
+				result[gIdx] = c // 同类动态 Cookie，用后面的（更新的）覆盖前面的
+			} else {
+				dynamicGroupIdx[groupKey] = len(result)
+				result = append(result, c)
+			}
+			continue
+		}
+
+		if idx, exists := seen[c.Name]; exists {
+			result[idx] = c
+		} else {
+			seen[c.Name] = len(result)
+			result = append(result, c)
 		}
 	}
-	return res.Cookies()
+
+	return result
 }
 
 // checkStatusError 统一校验 HTTP 状态码（允许 2xx 和 ErrUseLastResponse 产生的 3xx）

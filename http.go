@@ -386,13 +386,16 @@ func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
       MaxConnsPerHost:       200,
     }
 
-    // 处理随机代理模式：彻底禁用连接池与 TCP KeepAlive
+    // 处理随机代理模式：彻底禁用连接池、TCP KeepAlive 以及 HTTP/2
+    // 单次短连接（用完即弃）如果协商出 HTTP/2，会导致每次请求额外派生多个 h2 readLoop 协程并在请求结束时立刻 closeConn
     if b.randomProxy {
       baseDialer.KeepAlive = -1
       transport.DisableKeepAlives = true
       transport.MaxIdleConnsPerHost = -1
       transport.MaxIdleConns = 0
       transport.IdleConnTimeout = 0
+      transport.ForceAttemptHTTP2 = false
+      transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
     }
 
     // 代理路由与底层连接策略
@@ -413,39 +416,11 @@ func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
         if err != nil {
           return nil, fmt.Errorf("failed to create socks proxy dialer: %w", err)
         }
-
-        transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-          if contextDialer, ok := socksDialer.(proxy.ContextDialer); ok {
-            return contextDialer.DialContext(ctx, network, addr)
-          }
-
-          dialCtx, cancel := context.WithTimeout(ctx, baseDialer.Timeout)
-          defer cancel()
-
-          type result struct {
-            conn net.Conn
-            err  error
-          }
-          resultCh := make(chan result, 1)
-
-          go func() {
-            conn, err := socksDialer.Dial(network, addr)
-            if dialCtx.Err() != nil {
-              if conn != nil {
-                _ = conn.Close()
-              }
-              return
-            }
-            resultCh <- result{conn, err}
-          }()
-
-          select {
-          case <-dialCtx.Done():
-            return nil, dialCtx.Err()
-          case res := <-resultCh:
-            return res.conn, res.err
-          }
+        contextDialer, ok := socksDialer.(proxy.ContextDialer)
+        if !ok {
+          return nil, fmt.Errorf("socks proxy dialer does not support ContextDialer")
         }
+        transport.DialContext = contextDialer.DialContext
       case "http", "https":
         transport.Proxy = http.ProxyURL(proxyURL)
         transport.DialContext = baseDialer.DialContext
@@ -457,12 +432,16 @@ func (b *clientBuilder) getOrBuildTransport() (*http.Transport, error) {
     }
 
     // --- TLS 配置 ---
-    if b.skipInsecure || b.caCert != "" {
+    if b.skipInsecure || b.caCert != "" || b.randomProxy {
+      nextProtos := []string{"h2", "http/1.1"}
+      if b.randomProxy {
+        nextProtos = []string{"http/1.1"} // 随机短连接代理只走轻量级 HTTP/1.1
+      }
       tlsConfig := &tls.Config{
         InsecureSkipVerify: b.skipInsecure,
         MinVersion:         tls.VersionTLS12,
-        // 显式声明 ALPN 协议列表，防止自定义 DialContext + TLSConfig 下 HTTP/2 协商失效
-        NextProtos: []string{"h2", "http/1.1"},
+        // 显式声明 ALPN 协议列表，防止自定义 DialContext + TLSConfig 下协议协商偏离预期
+        NextProtos: nextProtos,
       }
       if b.caCert != "" {
         // 优先继承系统默认根证书池，避免配置自定义 CA 后无法访问常规公网 HTTPS
